@@ -1,0 +1,228 @@
+# Model Selection
+
+We test different models in Python.
+
+{{< include global-settings.qmd >}}
+
+                  
+## Data Preparation
+
+```{r}
+mc_ml_data = read.csv("data-clean/20230512.csv") |> 
+  filter(well_position %in% gradient_matrix_well,
+                rep == 1,
+                cycle == 30) |> 
+  select(starts_with('label_'), starts_with('T')) |> 
+  mutate(label_E = log2(label_E), label_P = log2(label_P))
+
+write.csv(mc_ml_data, 'data-clean/model-selection-data.csv')
+```
+
+## Models
+
+```{python}
+# import linear models
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
+from sklearn.linear_model import Lasso
+from sklearn.linear_model import ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+
+# import ensemble regressors
+from sklearn.ensemble import AdaBoostRegressor
+from sklearn.ensemble import BaggingRegressor
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
+
+# import decision tree
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import LinearSVR
+
+# import additional multioutput regressors
+from sklearn.multioutput import RegressorChain, MultiOutputRegressor
+
+base_regressor = GradientBoostingRegressor(random_state=1)
+multi_output_gradient_boosting_regression = MultiOutputRegressor(base_regressor)
+
+base_regressor = LinearSVR(dual=True, max_iter=5000)
+multi_output_linear_svr_regression = MultiOutputRegressor(base_regressor)
+
+# 创建Ridge基础估计器并封装为MultiOutputRegressor
+base_regressor = Ridge(alpha=1.0)
+multi_output_ridge_regression = MultiOutputRegressor(base_regressor)
+
+# 创建Lasso基础估计器并封装为MultiOutputRegressor
+base_regressor = Lasso(alpha=1.0, max_iter=3000)
+multi_output_lasso_regression = MultiOutputRegressor(base_regressor)
+
+# 创建ElasticNet基础估计器并封装为MultiOutputRegressor
+base_regressor = ElasticNet(alpha=1.0, l1_ratio=0.5, max_iter=3000)
+multi_output_elasticnet_regression = MultiOutputRegressor(base_regressor)
+
+# 创建Bagging基础估计器并封装为MultiOutputRegressor
+base_regressor = BaggingRegressor(random_state=1)
+multi_output_bagging_regression = MultiOutputRegressor(base_regressor)
+
+# 创建AdaBoost基础估计器并封装为MultiOutputRegressor
+base_regressor = AdaBoostRegressor(random_state=1)
+multi_output_adaboost_regression = MultiOutputRegressor(base_regressor)
+
+# 创建不同的回归模型对象
+models = {
+  'Linear': LinearRegression(),
+  'Ridge': multi_output_ridge_regression,
+  'Lasso': multi_output_lasso_regression,
+  'ElasticNet': multi_output_elasticnet_regression,
+  'K-Neighbors': KNeighborsRegressor(),
+  'Decision Tree': DecisionTreeRegressor(),
+  'RandForest': RandomForestRegressor(),
+  'Bagging': multi_output_bagging_regression,
+  'AdaBoost': multi_output_adaboost_regression,
+  'GradBoost': multi_output_gradient_boosting_regression,
+  'SVM': multi_output_linear_svr_regression
+  }
+```
+
+## Model Metrics
+
+Test different models with same training data, and fetch the model metrics of `r2_score`, `mean_squared_error` and `mean_absolute_error`.
+
+```{python}
+# import required modules
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import warnings
+
+class meltingCurveExperiment:
+  '''
+  define a meltingCurveExperiment
+  '''
+  
+  def __init__(self, file=None, data=None, test_size=0.05):
+    # deal with input
+    if data is not None:
+      if file is not None:
+        warnings.warn("`data` will be used.", UserWarning)
+        data = data
+    elif file is not None:
+      # 如果只提供了 file，则从文件加载数据
+      data = pd.read_csv(file)
+    else:
+      # 如果没有提供 file 和 data，则引发错误
+      raise ValueError("You must provide a `file` or `data` argument.")
+        
+    data = data.dropna(axis=1, how='all')
+    data = data.dropna()
+    self.data = data
+    X = data.filter(regex = "^T")
+    y = data.filter(regex = "^label_")
+    self.X_train, self.X_test, self.y_train, self.y_test = (
+      train_test_split(X, y, test_size=test_size)
+    )
+            
+  def cross_validate_regression_models(self, models, cv=10):
+    """
+    对给定的多个回归模型使用十折交叉验证进行建模，并计算多个参数。
+    
+    参数:
+      models: 字典，包含不同名称的回归模型对象，键为模型名称，值为模型对象。
+      cv: 整数，指定交叉验证的折数，默认为10。
+      
+    返回值:
+      results: 字典，包含每个模型的参数值，键为模型名称，值为参数值的字典，
+               其中包含MSE、R^2、MAE等。
+    """
+    results = {}
+    kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+    
+    for model_name, model in models.items():
+      rmse_values = []
+      r2_values = []
+      mae_values = []
+      
+      for train_idx, test_idx in kf.split(self.X_train):
+        X_train_fold = self.X_train.iloc[train_idx]
+        X_test_fold = self.X_train.iloc[test_idx]
+        y_train_fold = self.y_train.iloc[train_idx]
+        y_test_fold = self.y_train.iloc[test_idx]
+        
+        # 使用模型对训练集进行拟合
+        model.fit(X_train_fold, y_train_fold)
+        
+        # 使用训练好的模型进行预测
+        y_pred_fold = model.predict(X_test_fold)
+        
+        # 计算每个折叠的均方误差、R^2值、平均绝对误差和解释方差得分
+        mse_fold = mean_squared_error(y_test_fold, y_pred_fold)
+        r2_fold = r2_score(y_test_fold, y_pred_fold)
+        mae_fold = mean_absolute_error(y_test_fold, y_pred_fold)
+        
+        rmse_values.append(np.sqrt(mse_fold))
+        r2_values.append(r2_fold)
+        mae_values.append(mae_fold)
+        
+        # 将结果存储在字典中
+        results[model_name] = {'rmse': rmse_values, 
+        'rsq': r2_values, 
+        'mae': mae_values}
+        self.results = results
+            
+                      
+  def results_to_df(self, extra = None):
+    data_dict = self.results
+    raw = []
+    for i in data_dict.keys():
+      for j in data_dict[i].keys():
+        raw.append({'model':i, 'metric':j, 'value': data_dict[i][j]})
+        df = pd.DataFrame(raw)
+        df = df.explode('value').reset_index(drop=True)
+        
+    if extra is not None:
+      for col_name, col_data in extra.items():
+        df[col_name] = col_data
+        
+    # return
+    return(df)
+```
+      
+
+## Evaluation
+
+We test different model in Python. 
+
+```{python}
+exp = meltingCurveExperiment(file='data-clean/model-selection-data.csv')
+exp.cross_validate_regression_models(models=models)
+exp.results_to_df().to_csv('data-clean/model-selection-metric.csv', index = False)
+```
+
+Metric comparison revealed that ensemble machine learning methods, including Bagging, GradBoost and RandForest, have the best prediction performances [@fig-model-selection].
+                                
+                                
+```{r}
+#| label: fig-model-selection
+#| fig-asp: 0.4
+#| fig-width: 8
+#| fig-cap: "Assessment of various machine learning algorisms in modeling and prediction with melting curve data."
+model_ordered = paste('Linear,Lasso,Ridge,ElasticNet,SVM,GradBoost,AdaBoost',
+                      'Bagging,K-Neighbors,Decision Tree,RandForest',
+                      sep = ",")  |> str_split_1(",")
+mc_ml_cv_metric = read.csv('data-clean/model-selection-metric.csv') |> 
+  mutate(model = factor(model, levels = model_ordered))
+metrics = mc_ml_cv_metric$metric |> unique()
+
+p_mc_ml_cv_metric = lapply(metrics, function(x){
+  mc_ml_cv_metric |> 
+    filter(metric == x) |> 
+    ggplot(aes(model, value)) +
+    geom_boxplot(outliers = FALSE) +
+    labs(x = NULL, y = x) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1.1, vjust = 1.1))
+})
+
+plot_grid(plotlist = p_mc_ml_cv_metric, ncol = 3, labels = "auto")
+
+ggsave(filename = "figures/figure3a.jpg")
+```

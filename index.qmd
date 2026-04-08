@@ -1,0 +1,13 @@
+# Preface {.unnumbered}
+
+This book contains the supplementary information of the manuscript entitled "Precise prediction of synthetic community structure with high-resolution melting curve and machine learning" authored by Chun-Hui Gao, Jiaqi He, et. al.
+
+----
+
+:::{.callout-note}
+This is a Quarto book, created from markdown and executable code.
+
+See @knuth84 for additional discussion of literate programming.
+
+To learn more about Quarto books visit <https://quarto.org/docs/books>.
+:::

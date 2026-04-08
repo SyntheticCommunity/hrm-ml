@@ -1,0 +1,194 @@
+# Model Optimization
+
+{{< include global-settings.qmd >}}
+
+
+## Data, Functions
+
+```{r}
+all_data = read.csv("data-clean/20230512.csv") |> 
+  filter(well_position %in% gradient_matrix_well) |> 
+  mutate(label_E = log2(label_E), label_P = log2(label_P))
+```
+
+
+```{r}
+# get metric with specified parameters
+rf_metric = function(train_data, 
+                     test_data = NULL, 
+                     y = "label_E", 
+                     X = starts_with("T"), 
+                     ...){
+  model = rand_forest(mode = "regression", trees = 1000) |> 
+    set_engine("ranger", importance = 'impurity', num.threads = 10)
+  train_data = train_data |> select(all_of(y), all_of(X))
+  formula = as.formula(paste(y, ".", sep = "~"))
+  fit = workflow() |> 
+    add_recipe(recipe(formula, data = train_data)) |> 
+    add_model(model) |> 
+    fit(train_data)
+  prediction = augment(fit, new_data = test_data)
+  extra = enquos(...)
+  metric = prediction |> 
+    metrics(truth = y, estimate = .pred) |> 
+    mutate(!!!extra)
+  return(metric)
+}
+
+# to plot metric
+plot_metric = function(data, x, y = ".estimate", metric = 'rsq', color = "black"){
+  data |> filter(.metric == metric) |> 
+    ggplot(aes(.data[[x]], .data[[y]], color = I(color))) +
+    geom_point(shape = 21) +
+    geom_smooth(method = "loess") +
+    labs(x = x, y = metric)
+}
+```
+
+## Size of Training Data
+
+Use one experiment data to train, and the other experiment data to test.
+
+
+```{r}
+rep2 = all_data |> 
+  dplyr::filter(rep == 2,
+                cycle == 30) |> 
+  dplyr::select(starts_with('label_'), starts_with('T'))
+
+rep3 = all_data |> 
+  dplyr::filter(rep == 3,
+                cycle == 30) |> 
+  dplyr::select(starts_with('label_'), starts_with('T'))
+```
+
+Using different size of training data to fit and evaluate the prediction result of same test data.
+
+```{r}
+prop = rep(seq(0.05, 0.95, by = 0.05), each = 10) 
+rf_rep_metric = lapply(prop, function(p){
+  lapply(seq_along(strain_label), function(i){
+    data_split = initial_split(rep2, prop = p)
+    ylab = strain_label[[i]]
+    train = training(data_split) |> select(matches(ylab), starts_with("T"))
+    test = rep3 |> select(any_of(ylab), starts_with("T"))
+    rf_metric(train, test, ylab, prop = nrow(train), species = ylab)
+  }) |> bind_rows()
+}) |> bind_rows()
+```
+
+
+
+```{r}
+p_grad = lapply(seq_along(strain_label), function(i){
+  lapply(c('rmse','rsq','mae'), function(m){
+    df = rf_rep_metric |> 
+      dplyr::filter(species == strain_label[[i]])
+    plot_metric(df, x = "prop", metric = m, color = I(strain_color[[i]])) +
+      labs(x = NULL, y = m)
+  })
+}) |> unlist(recursive = FALSE)
+
+plot_grid(plotlist = p_grad, ncol = 3, align = "hv", labels = "auto")
+```
+
+
+## Thermo Cycles
+
+```{r}
+thermo_cycle_metric = lapply(c(30, 35, 40), function(c){
+  mc_ml_data = all_data |> 
+    filter(cycle == c, rep %in% 2:3)
+  lapply(1:10, function(x){
+    data = initial_split(mc_ml_data)
+    results = lapply(seq_along(strain_label), function(i){
+      train = training(data)
+      test = testing(data)
+      strain = strain_label[[i]]
+      rf_metric(train, test, y = strain, cycle = c, species = strain)
+    })
+    
+    bind_rows(results)
+  }) |> bind_rows()
+}) |> 
+  bind_rows() |> 
+  mutate(cycle = paste(cycle, "x"))
+```
+
+```{r}
+library(ggpubr)
+# to plot metric
+boxplot_metric = function(data, x, y = ".estimate", metric = 'rsq', color = "black"){
+  data |> filter(.metric == metric) |> 
+    ggplot(aes(.data[[x]], .data[[y]], color = I(color))) +
+    geom_boxplot(outliers = FALSE) +
+    geom_jitter(width = 0.2) +
+    stat_compare_means(label = "p.format", vjust = 0.5) +
+    labs(x = NULL, y = metric)
+}
+
+p_cycle = lapply(seq_along(strain_label), function(i){
+  lapply(c('rmse','rsq','mae'), function(m){
+    df = thermo_cycle_metric |> 
+      dplyr::filter(species == strain_label[[i]])
+    boxplot_metric(df, x = "cycle", metric = m, color = I(strain_color[[i]]))
+  })
+}) |> unlist(recursive = FALSE)
+
+plot_grid(plotlist = p_cycle, align = "hv", ncol = 3, labels = "auto")
+
+```
+
+
+## Temperature Increment Rate
+
+```{r}
+rate_map = c(`1` = "0.015", `2` = "0.03 °C/s")
+rate_metric = lapply(c(1, 2), function(r){
+  mc_ml_data = all_data |> 
+    filter(cycle == 30, rep == r)
+  lapply(1:10, function(x){
+    data = initial_split(mc_ml_data)
+    results = lapply(seq_along(strain_label), function(i){
+      train = training(data)
+      test = testing(data)
+      strain = strain_label[[i]]
+      rf_metric(train, test, y = strain, rate = r, species = strain)
+    })
+    
+    bind_rows(results)
+  }) |> bind_rows()
+}) |> bind_rows() |> 
+  rowwise() |> 
+  mutate(rate = rate_map[[rate]])
+
+
+p_rate = lapply(seq_along(strain_label), function(i){
+  lapply(c('rmse','rsq','mae'), function(m){
+    df = rate_metric |> 
+      dplyr::filter(species == strain_label[[i]])
+    boxplot_metric(df, x = "rate", metric = m, color = I(strain_color[[i]])) +
+      labs(x = NULL, y = m)
+  })
+}) |> unlist(recursive = FALSE)
+
+plot_grid(plotlist = p_rate, align = "hv", ncol = 3, labels = "auto")
+```
+
+## Combined Results
+
+```{r}
+#| fig-asp: 0.8
+#| fig-width: 7
+gglist = c(p_cycle[c(2,5)], p_rate[c(2,5)])
+plot_grid(
+  plot_grid(plotlist = p_grad[c(2,5)], labels = c("a","b")), 
+  plot_grid(plotlist = gglist, nrow = 1, 
+            align = "v",
+            rel_widths = c(1.2,1.2,1,1), 
+            labels = letters[3:6]), 
+  ncol = 1)
+
+ggsave("figures/figure4.jpg")
+```
+

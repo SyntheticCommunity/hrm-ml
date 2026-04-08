@@ -1,0 +1,335 @@
+# Method Evaluation
+
+Comparison of HRM-ML with two golden standards, strain-specific qPCR and 16S rRNA gene sequencing.
+
+{{< include global-settings.qmd >}}
+
+## Functions
+
+```{r}
+plot_syncom = function(data){
+  ggplot(data, aes(sample, quantity, fill = species)) +
+  geom_col() +
+  theme(legend.position = "top") +
+  scale_x_discrete(labels = function(x) {
+    x[seq(2, length(x), 2)] <- "" 
+    x
+  })
+}
+```
+
+
+## By 16S rRNA gene sequencing
+
+Use DADA2 to process 16S rRNA gene sequencing data.
+
+```{r}
+#| eval: false
+# raw data
+dir = '/Volumes/Data/Projects/MbPL2024051607'
+fastq_files = list.files(path = dir, pattern = ".merged.fastq.gz", 
+                         recursive = TRUE, full.names = TRUE)
+sample.names = dirname(fastq_files) |> basename()
+
+# filter and trim sequence
+filt_path = file.path("./data-raw/application-ngs")
+if (!dir.exists(filt_path)) dir.create(filt_path)
+
+library(dada2)
+
+for (i in seq_along(fastq_files)) {
+  fastq_filt = file.path(filt_path, basename(fastq_files[i]))
+  filterAndTrim(fastq_files[i], fastq_filt, 
+                maxN = 0, maxEE = 2, truncQ = 2, rm.phix = TRUE,
+                compress = TRUE, multithread = TRUE)
+}
+```
+
+
+```{r}
+#| cache: true
+library(dada2)
+ngs_path = "data-raw/application-ngs"
+
+# learn error
+err = learnErrors(ngs_path, multithread = TRUE, verbose = FALSE)
+
+# denoise
+dadaFs = derepFastq(ngs_path) |> 
+  dada(err = err, multithread = TRUE)
+names(dadaFs) = gsub(".merged.fastq.gz", "", names(dadaFs))
+
+# build sequence table
+seqtab = makeSequenceTable(dadaFs)
+
+# remove chimera
+seqtab.nochim = removeBimeraDenovo(seqtab,
+                                   method = "consensus", 
+                                   multithread = TRUE)
+
+# assign taxonomy
+silva_train_set = "~/Projects/Silva/silva_nr99_v138.1_train_set.fa.gz"
+taxa = assignTaxonomy(seqtab.nochim, silva_train_set, multithread = TRUE)
+```
+
+To use Silva database in `assignTaxonomy()`, you should download it at <https://benjjneb.github.io/dada2/training.html>.
+
+```{r}
+# build phyloseq object
+library(phyloseq)
+ps = phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE), tax_table(taxa))
+
+# plot community
+plot_bar(ps, fill = "Genus") +
+  theme(legend.position = "top")
+```
+
+
+```{r}
+# merge low abundant noise
+taxa_sums = taxa_sums(ps)
+threshold = 0.001 * sum(taxa_sums) # threshold is 0.1%
+low_abundance = taxa_sums < threshold
+ps_merged = merge_taxa(ps, taxa_names(ps)[low_abundance])
+
+# plot community
+plot_bar(ps_merged, fill = "Genus") +
+  theme(legend.position = "top")
+```
+
+
+```{r}
+tax_structure = otu_table(ps_merged) |> 
+  as.data.frame() |> 
+  tibble::rownames_to_column("sample") |> 
+  as_tibble()
+colnames(tax_structure)[2:4] = c("ppu","eco","others")
+sequencing_result = tax_structure |> 
+  pivot_longer(cols = -sample, names_to = "species", values_to = "quantity") |> 
+  filter(species != 'others') |> 
+  mutate(method = 'NGS')
+
+plot_syncom(sequencing_result)
+```
+
+## By strain-specific qPCR
+
+- Build standard curve
+- Calculate strain abundance
+
+```{r}
+library(mcmodel)
+
+# read qPCR results
+result = read_quantstudio(xfun::magic_path("application-qPCR-result.txt")) |> 
+  get_quantstudio_result() |> 
+  select(well_position, ct) |> 
+  mutate(ct = as.numeric(ct))
+
+# read plate layout
+plate = read.csv(xfun::magic_path("application-plate-layout.csv"))
+
+# combine results and plate layout
+result = result |> left_join(plate, by = "well_position")
+```
+
+```{r}
+std_quantity = tibble(
+  well_position = paste0(rep("P", 24), 1:24),
+  log2quantity = (rep(2E9, 24)/rep(10^(0:7), each = 3)) |> log2()
+)
+
+std_sample = result |> 
+  filter(target == 'std') |> 
+  select(well_position, ct)  |> 
+  left_join(std_quantity, by = "well_position") |> 
+  select(ct, log2quantity) |> 
+  na.omit()
+```
+
+
+```{r}
+std_fit = lm(log2quantity ~ ct, std_sample)
+summary(std_fit)
+```
+
+
+```{r}
+unk_sample = result |> 
+  filter(target %in% c('EC','PP'))
+
+unk_sample_predition = broom::augment(std_fit, newdata = unk_sample)
+```
+
+
+```{r}
+qPCR_result = unk_sample_predition |> 
+  summarise(predict = mean(.fitted, na.rm = TRUE), .by = c(sample, target)) |> 
+  mutate(species = if_else(target == 'EC', 'eco', 'ppu'),
+         quantity = 2^predict,
+         method = 'qPCR') |> 
+  select(sample, species, quantity, method)
+```
+
+```{r}
+plot_syncom(qPCR_result)
+```
+
+
+## By HRM-ML method
+
+
+```{r}
+filename = xfun::magic_path("application-qPCR-result.txt")
+plate = read.csv(xfun::magic_path("application-plate-layout.csv"))
+
+all = read_quantstudio(filename)
+sample = plate |> 
+  mutate(cycle = 30) |> 
+  dplyr::filter(target == '16S')
+mc240617 = quantstudio2mc(all, plate = sample)  |> 
+  filterData(from = 75, to = 90, well_position = sample$well_position) |> 
+  transformData(step = 0.1)
+
+
+data240617 = mc_tbl2wider(mc240617)
+
+write_csv(data240617, "data-clean/20240617.csv")
+```
+
+
+```{r}
+# data
+train_data = read.csv("data-clean/20230512.csv") |> 
+  dplyr::filter(well_position %in% gradient_matrix_well,
+                cycle == 30, rep == 1) |> 
+  dplyr::select(starts_with('label_'), starts_with('T')) |> 
+  mutate(label_E = log2(label_E), label_P = log2(label_P))
+
+# test data
+test_data = read.csv("data-clean/20240617.csv")
+
+library(parsnip)
+library(recipes)
+library(workflows)
+rf_spec = rand_forest(mode = "regression", trees = 1000) |> 
+  set_engine("ranger", importance = 'impurity', num.threads = 10)
+
+predictions = lapply(seq_along(strain_label), function(i){
+  label = strain_label[[i]]
+  train = train_data |> select(matches(label), starts_with("T"))
+  recipe = recipe(formula = as.formula(paste(label, '.', sep = '~')), 
+                  data = train)
+  
+  rf_wflow = workflow()  |> 
+    add_recipe(recipe)  |> 
+    add_model(rf_spec) 
+  
+  rf_fit = rf_wflow |> 
+    fit(train)
+  
+  prediction = augment(rf_fit, new_data = test_data) |> 
+    select(-starts_with("T")) |> 
+    mutate(label = strain_label[[i]])
+  
+  return(prediction)
+})
+
+HRM_result = predictions |> 
+  bind_rows() |> 
+  summarise(.pred = mean(.pred), .by = c(sample, label)) |> 
+  mutate(species = if_else(label == 'label_E', 'eco', 'ppu'),
+         quantity = 2^.pred,
+         method = 'HRM-ML') |> 
+  select(sample, species, quantity, method)
+```
+
+```{r}
+HRM_result |> plot_syncom()
+```
+
+
+## Comparison
+
+```{r}
+three_result = list(qPCR_result, sequencing_result, HRM_result) |> 
+  bind_rows() |> 
+  group_by(method, sample) |> 
+  mutate(prop = quantity/sum(quantity)) |> 
+  ungroup()
+
+```
+
+```{r}
+p_prop = ggplot(three_result, aes(sample, prop, fill = species)) +
+  geom_col() +
+  facet_wrap(~method, ncol = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_discrete(labels = function(x) {
+    x[seq(2, length(x), 2)] <- "" 
+    x
+  }) +
+  scale_fill_manual(values = strain_color) +
+  labs(x = NULL, y = "proportion") +
+  theme(legend.position = "none")
+
+p_prop
+```
+
+
+```{r}
+library(tidyr)
+ec_prop = three_result |> 
+  filter(species == 'eco') |> 
+  pivot_wider(id_cols = sample, names_from = method, values_from = prop) |> 
+  na.omit()
+
+cor(ec_prop |> select(-sample), method = "spearman")
+```
+
+```{r}
+ec_prop_difference = ec_prop |> 
+  rowwise() |> 
+  mutate(qPCR_vs_mc = mean(abs(qPCR - `HRM-ML`)),
+         qPCR_vs_ngs = -mean(abs(qPCR - NGS))) |> 
+  pivot_longer(cols = starts_with('qPCR_vs'), 
+               names_to = 'comparison', 
+               values_to = 'abs_distance')
+
+# mean absolute differences
+ec_prop_difference |> summarise(average = mean(abs(abs_distance)), .by = comparison)
+```
+
+
+```{r}
+p_diff = ec_prop_difference |>
+  ggplot(ggplot2::aes(sample, abs_distance, fill = comparison)) +
+  geom_col() +
+  scale_x_discrete(labels = function(x) {
+    x[seq(2, length(x), 2)] <- "" 
+    x
+  }) +
+  annotate("label", x = -Inf, y = Inf, 
+           label = "HRM-ML vs qPCR", 
+           hjust = -0.1, vjust = 1.5, label.size = NA,
+           color = "#1B9E77") +
+  annotate("label", x = -Inf, y = -Inf, 
+           label = "NGS vs qPCR", 
+           hjust = -0.1, vjust = -0.5, label.size = NA,
+           color = "#D95F02") +
+  labs(y = "absolute difference") +
+  scale_y_continuous(labels = function(x) scales::percent(abs(x))) +
+  scale_fill_manual(values = c("#1B9E77", "#D95F02")) +
+  theme(legend.position = "none")
+
+p_diff
+```
+
+```{r}
+#| fig-asp: 0.9
+plot_grid(p_prop, p_diff, align = "v", ncol = 1, 
+          rel_heights = c(2, 1), 
+          labels = "auto")
+ggsave("figures/figure5.jpg")
+```
+

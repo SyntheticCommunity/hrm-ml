@@ -1,0 +1,192 @@
+# Dual-species Modelling
+
+We use Random Forest to model dual-species melting curve data.
+
+{{< include global-settings.qmd >}}
+
+## Two-species design
+
+The plate setting used in melting curve analysis is provided in a `csv` file. Original value for each column is the times of two-fold dilution, and we transform them into DNA quantity as related to the original concentration (assumed to be 1). Note: a label value of `16` means not contain this species.
+
+```{r}
+# read plate setting
+plate_file = xfun::magic_path("modeling-plate-labels.csv")
+plate = read.csv(plate_file)
+plate2 = plate |> 
+  drop_na() |> 
+  mutate(label_E = ifelse(label_E == 0, 1, ifelse(label_E == 16, 0, 1/2^label_E)),
+         label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
+
+```
+
+Layout of gradient dilution matrix [@fig-plate-layout-of-gradient-matrix].
+
+```{r}
+#| label: fig-plate-layout-of-gradient-matrix
+#| fig-asp: 0.35
+#| fig-width: 7
+#| fig-cap: Layout of gradient dilution matrix.
+p_concentration = lapply(seq_along(strain_label), function(i){
+  plot_384_single_concentration(plate2, strain_label[[i]], well_size = 1.5) + 
+    scale_color_gradient(high = strain_color[[i]], 
+                         low = "white", 
+                         trans = "log2", 
+                         na.value = "grey90") +
+    coord_equal(xlim = c(6.5,22.5)) +
+    theme(legend.position = 'none',
+          axis.text = element_blank())
+})
+
+p_concentration[[1]] = p_concentration[[1]] + 
+  labs(x = " ", y = expression(log[2]*Q[1]~(low %->% high)))
+
+p_concentration[[2]] = p_concentration[[2]] + 
+  labs(x = expression(log[2]*Q[2]~(high %->% low)), y = " ")
+
+plate3 = plate2 |> 
+  dplyr::filter(well_position %in% gradient_matrix_well)
+
+p_matrix = plot_384_community_structure(plate3) + 
+  scale_fill_manual(values = c("red3","purple3")) +
+  coord_equal(xlim = c(6.5,22.5)) +
+  theme(legend.position = 'none',
+        axis.text = element_blank()) +
+  labs(x = expression(log[2]*Q[2]~(high %->% low)),
+       y = expression(log[2]*Q[1]~(low %->% high)))
+
+plot_grid(p_concentration[[1]], 
+          p_concentration[[2]], 
+          p_matrix, 
+          align = 'hv',
+          ncol = 3,
+          labels = "auto")
+
+ggsave(filename = "figures/figure2a.jpg")
+```
+
+Melting curves of gradient dilution matrix [@fig-mc-of-gradient-matrix].
+
+```{r}
+# read qPCR run results
+raw_file = xfun::magic_path("cycle30-experiment1.txt")
+quantstudio_raw = read_quantstudio(raw_file)
+mc = quantstudio2mc(quantstudio_raw, plate = plate2, primer = "V4")
+mc = filterData(mc, from = 80, to = 90) |> 
+  transformData(step = 0.1)
+```
+
+## Gradient Dilution Matrix
+
+```{r}
+#| label: fig-mc-of-gradient-matrix
+#| fig-cap: Melting curves of gradient dilution matrix.
+#| fig-asp: 0.8
+#| fig-width: 7
+mc_df = mc2tbl(mc)
+mc_df_matrix = mc_df |> 
+  dplyr::filter(well_position %in% gradient_matrix_well) |> 
+  dplyr::mutate_at(c('label_E','label_P'), 
+                   function(x) log2(x) |> as_factor() |> fct_rev())
+
+ggplot(mc_df_matrix, aes(temperature, derivative, group = well_position)) +
+  geom_line() +
+  scale_x_continuous(position = 'top') +
+  facet_grid(label_E ~ label_P, switch = 'y') +
+  labs(x = expression(log[2]*Q[2]~(high %->% low)),
+       y = expression(log[2]*Q[1]~(low %->% high))) +
+  theme(legend.position = "none",
+        panel.spacing = unit(1, "pt"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),)
+
+ggsave("figures/figure2c.jpg")
+```
+
+                                
+## Random Forest Modelling
+
+```{r}
+# data
+mc_ml_data = read.csv("data-clean/20230512.csv") |> 
+  dplyr::filter(well_position %in% gradient_matrix_well,
+                cycle == 30, rep == 2) |> 
+  mutate(label_E = log2(label_E), label_P = log2(label_P))
+
+data = initial_split(mc_ml_data)
+data_train = training(data)
+data_test = testing(data)
+```
+
+```{r}
+lm_spec = linear_reg(engine = "lm")
+
+rf_spec = rand_forest(mode = "regression", trees = 1000) |> 
+  set_engine("ranger", importance = 'impurity', num.threads = 10)
+
+plot_model_metric = function(predictions, model_metrics, truth_label, color){
+  annotation = paste(model_metrics[['.metric']], 
+                     format(round(model_metrics[['.estimate']], 2), digits = 2), 
+                     sep = ": ", 
+                     collapse = "\n")
+  ggplot(predictions, aes(.data[[truth_label]], `.pred`, color = I(color))) +
+    geom_point(shape = 21) +
+    geom_abline(slope = 1, linetype = 'dashed', color = color) +
+    annotate("text", x = -Inf, y = Inf, color = I(color), label = annotation, 
+             hjust = -0.1, vjust = 1.1) +
+    coord_equal() +
+    xlim(c(-16,0)) + ylim(c(-16, 0)) +
+    labs(x = expression(log[2]*Q[true]), y = expression(log[2]*Q[pred]))
+}
+```
+
+```{r}
+#| fig-asp: 0.35
+#| fig-width: 8.5
+p_lm_predict = lapply(seq_along(strain_label), function(i){
+  train = data_train |> select(matches(strain_label[[i]]), starts_with("T"))
+  test = data_test  |> select(matches(strain_label[[i]]), starts_with("T"))
+  recipe = recipe(as.formula(paste(strain_label[[i]], '.', sep = '~')), 
+                  data = train)
+  
+  fit = workflow() |> 
+    add_recipe(recipe) |> 
+    add_model(lm_spec) |> 
+    fit(train)
+  
+  prediction = augment(fit, new_data = test) 
+  
+  metric = prediction |> 
+    metrics(truth = strain_label[[i]], estimate = .pred) 
+  
+  plot_model_metric(prediction, metric, strain_label[[i]], strain_color[[i]]) + 
+    labs(subtitle = 'Linear')
+})
+
+
+p_rf_predict =  lapply(seq_along(strain_label), function(i){
+  train = data_train |> select(matches(strain_label[[i]]), starts_with("T"))
+  test = data_test  |> select(matches(strain_label[[i]]), starts_with("T"))
+  recipe = recipe(as.formula(paste(strain_label[[i]], '.', sep = '~')), 
+                  data = train)
+  
+  fit = workflow()  |> 
+    add_recipe(recipe)  |> 
+    add_model(rf_spec) |> 
+    fit(train)
+  
+  prediction = augment(fit, new_data = test) 
+  
+  metric = prediction |> 
+    metrics(truth = strain_label[[i]], estimate = .pred)
+  
+  plot_model_metric(prediction, metric, strain_label[[i]], strain_color[[i]]) + 
+    labs(subtitle = 'RandForest')
+})
+
+
+plot_grid(plotlist = c(p_lm_predict, p_rf_predict), ncol = 4, labels = letters[4:7])
+
+ggsave(filename = "figures/figure3d.jpg")
+```
+
+
