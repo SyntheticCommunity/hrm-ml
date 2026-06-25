@@ -1,0 +1,222 @@
+# New Data Single Species Modeling
+
+Reproduce @fig-linear-modelling-of-single-species with the new qPCR data (2026-03-19).
+
+{{< include global-settings.qmd >}}
+
+## Data Preprocess
+
+Read plate layout and transform labels to DNA quantities.
+
+```{r}
+library(dplyr)
+
+plate = read.csv(xfun::magic_path("modeling-plate-labels.csv")) |>
+  mutate(label_E = ifelse(label_E == 0, 1, ifelse(label_E == 16, 0, 1/2^label_E)),
+         label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
+```
+
+Read the new QuantStudio data file and process melting curves.
+
+```{r}
+library(mcmodel)
+library(stringr)
+
+filename = "data-raw/modeling-qPCR/2026-3-19 222158.txt"
+quantstudio_raw = read_quantstudio(filename)
+```
+
+## Amplification plot
+
+```{r}
+qs_amplification = get_quantstudio_amplication(quantstudio_raw)
+```
+
+```{r}
+p_amp = lapply(seq_along(strain_label), function(i){
+  df = qs_amplification  |>
+    dplyr::filter(well_position %in% strain_single_well[[i]]) |>
+    left_join(plate)
+
+  ggplot(df, aes(cycle, delta_rn, group = well_position)) +
+    geom_line(aes(color = .data[[strain_label[[i]]]])) +
+    geom_hline(yintercept = 0.124, linetype = 'dashed', color = 'grey') +
+    geom_text(x = -Inf, y = 0.124, label = 'Ct threshold',
+              hjust = -.25, vjust = -0.5, color = 'grey') +
+    scale_color_gradient(
+      high = strain_color[[i]], low = "white", trans = 'log2',
+      labels = trans_format("log2", label_number_auto()),
+      breaks = 2^c(0, -5, -10, -15)
+    ) +
+    labs(color = expression(log[2]*Q), y = 'fluorescence') +
+    theme(legend.position = "inside",
+          legend.position.inside = c(0.18,0.62))
+})
+```
+
+## Melting curve gradient
+
+```{r}
+mc = quantstudio2mc(quantstudio_raw, plate = plate, primer = "V4")
+mc = filterData(mc, from = 80, to = 90) |>
+  transformData(step = 0.1)
+```
+
+```{r}
+plot_mc_single = function(mc, label_color, vline_color){
+  tm = mc_get_tm(mc, npeaks = 1) |> pull(peak_position) |> median()
+
+  df = mc2tbl(mc) |>
+    select(-date, -primer) |>
+    summarize(derivative = median(derivative),
+              .by = all_of(c("temperature", label_color)))
+
+  ggplot(df,
+         aes(temperature, derivative,
+             color = .data[[label_color]],
+             group = .data[[label_color]])) +
+    geom_line() +
+    geom_vline(aes(xintercept = I(tm)),
+               linetype = 'dashed',
+               color = vline_color) +
+    geom_text(x = tm, y = Inf, hjust = -0.1, vjust = 2,
+              label = paste0("Tm = ", tm, "°C"),
+              color = vline_color)  +
+    scale_x_continuous(breaks = c(80, 85, 90)) +
+    labs(x = "temperature (°C)",
+         y = "fluorescence",
+         color = expression(log[2]*Q)) +
+    theme(legend.position = "inside",
+          legend.position.inside = c(0.75,0.5))
+}
+
+p_mc = lapply(seq_along(strain_label), function(i){
+  filterData(mc, well_position = strain_single_well[[i]]) |>
+    plot_mc_single(strain_label[[i]], strain_color[[i]]) +
+    scale_color_gradient(
+      high = strain_color[[i]],
+      low = "white",
+      trans = 'log2',
+      labels = trans_format("log2", label_number_auto()),
+      breaks = 2^c(0, -5, -10, -15)
+    )
+})
+```
+
+## Peak calling
+
+```{r}
+mono_mc = lapply(seq_along(strain_label), function(i){
+  x = filterData(mc, well_position = strain_single_well[[i]]) |>
+    transformData(step = 0.1)
+  df = mc2tbl(x) |>
+    select(-date, -primer) |>
+    nest(data = c(temperature, derivative)) |>
+    pivot_longer(cols = starts_with("label_"),
+                 names_to = "strain",
+                 values_to = "quantity")
+  peaks = lapply(df$data,
+                 mcmodel:::detect_tm,
+                 zero = "+",
+                 npeaks = 1,
+                 sortstr = TRUE,
+                 threshold = 0) |>
+    bind_rows()
+  bind_cols(df, peaks)
+}) |>
+  bind_rows() |>
+  dplyr::filter(quantity != 0)
+
+mono_mc$peak_area = sapply(1:nrow(mono_mc), function(i){
+  d = mono_mc$data[[i]] |>
+    filter(temperature >= mono_mc$peak_start[[i]],
+           temperature <= mono_mc$peak_end[[i]])
+  pracma::trapz(d$temperature, d$derivative)
+})
+
+peak_cols = paste('peak',
+                  c('height','area','start','position','end'),
+                  sep = "_")
+mono_mc = mono_mc |>
+  dplyr::select(well_position, strain, quantity, matches(peak_cols))
+```
+
+## Ct model of single species
+
+```{r}
+qs_results = get_quantstudio_result(quantstudio_raw) |>
+  dplyr::select(well_position, ct) |>
+  dplyr::mutate(ct = as.numeric(ct)) |>
+  left_join(plate) |>
+  pivot_longer(cols = starts_with("label_"),
+               names_to = "strain",
+               values_to = "quantity") |>
+  dplyr::filter(quantity != 0, !is.na(ct))
+
+mono_ct = qs_results |>
+  dplyr::filter(well_position %in% unlist(strain_single_well))
+```
+
+## Comparison of Ct and MC modelling
+
+```{r}
+plot_model_metric = function(model, test_data, color){
+  predictions = augment(model, newdata = test_data)
+  metrics = metric_set(rmse, rsq, mae)
+  model_metrics = metrics(predictions,
+                          truth = 'log2quantity',
+                          estimate = .fitted)
+  annotation = paste(model_metrics[['.metric']],
+                     round(model_metrics[['.estimate']], digits = 2),
+                     sep = ": ",
+                     collapse = "\n")
+  ggplot(predictions, aes(`log2quantity`, `.fitted`, color = I(color))) +
+    geom_point(shape = 21) +
+    geom_abline(slope = 1, linetype = 'dashed', color = color) +
+    annotate("text", x = -Inf, y = Inf, label = annotation,
+             color = I(color),
+             hjust = -0.1, vjust = 1.1) +
+    coord_equal() +
+    xlim(c(-16,0)) + ylim(c(-16, 0)) +
+    labs(x = expression(log[2]*Q[true]), y = expression(log[2]*Q[pred]))
+}
+
+p_model_ct = lapply(seq_along(strain_label), function(i){
+  data = mono_ct |>
+    dplyr::filter(well_position %in% strain_single_well[[i]]) |>
+    mutate(log2quantity = log2(quantity))
+  data_split_single = initial_split(data)
+  data_train_single = training(data_split_single)
+  data_test_single = testing(data_split_single)
+  model = lm(log2quantity ~ ct, data_train_single)
+  p = plot_model_metric(model, data_test_single,
+                        strain_color[[i]]) + labs(subtitle = 'Ct model')
+  return(p)
+})
+
+p_model_mc = lapply(seq_along(strain_label), function(i){
+  data = mono_mc |>
+    dplyr::filter(well_position %in% strain_single_well[[i]]) |>
+    mutate(log2quantity = log2(quantity))
+  data_split_single = initial_split(data)
+  data_train_single = training(data_split_single)
+  data_test_single = testing(data_split_single)
+  model = lm(log2quantity ~ peak_area + peak_height + peak_start + peak_end,
+             data_train_single)
+  plot_model_metric(model, data_test_single, strain_color[[i]]) +
+    labs(subtitle = 'MC model')
+})
+```
+
+## Combined Results
+
+```{r}
+#| label: fig-new-data-linear-modelling-of-single-species
+#| fig-width: 9.5
+#| fig-cap: Linear modelling and prediction of single species abundance with threshold cycle (Ct) and melting curve features using new qPCR data (2026-03-19).
+plot_grid(plotlist = c(p_amp, p_mc, p_model_ct, p_model_mc),
+          align = 'hv',
+          ncol = 4, nrow = 2, labels = 'auto')
+
+ggsave("figures/figure-new-data-single-species.jpg")
+```

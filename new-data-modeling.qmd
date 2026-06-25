@@ -1,0 +1,109 @@
+# New Data Modelling
+
+Use new qPCR data (2026-03-19) to reproduce the HRM-ML pipeline.
+
+{{< include global-settings.qmd >}}
+
+## Data Preprocess
+
+Read plate layout and transform labels to DNA quantities.
+
+```{r}
+library(dplyr)
+
+plate = read.csv(xfun::magic_path("modeling-plate-labels.csv")) |>
+  mutate(label_E = ifelse(label_E == 0, 1, ifelse(label_E == 16, 0, 1/2^label_E)),
+         label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
+```
+
+Read the new QuantStudio data file and process melting curves.
+
+```{r}
+library(mcmodel)
+library(stringr)
+
+filename = "data-raw/modeling-qPCR/2026-3-19 222158.txt"
+all = read_quantstudio(filename)
+
+sample = plate |>
+  mutate(cycle = 30, rep = 1)
+
+mc_new = quantstudio2mc(all, primer = "V4", plate = sample) |>
+  filterData(from = 80, to = 90) |>
+  transformData(step = 0.1)
+```
+
+Convert to wide data frame and save.
+
+```{r}
+data_new = mc_tbl2wider(mc_new)
+
+head(data_new)
+
+write.csv(data_new, file = "data-clean/20260319.csv", row.names = FALSE)
+```
+
+## Random Forest Modelling
+
+Filter to gradient matrix wells and log2-transform targets.
+
+```{r}
+mc_ml_data = read.csv("data-clean/20260319.csv") |>
+  dplyr::filter(well_position %in% gradient_matrix_well) |>
+  mutate(label_E = log2(label_E), label_P = log2(label_P))
+
+data = initial_split(mc_ml_data)
+data_train = training(data)
+data_test = testing(data)
+```
+
+Model specifications.
+
+```{r}
+rf_spec = rand_forest(mode = "regression", trees = 1000) |>
+  set_engine("ranger", importance = 'impurity', num.threads = 10)
+
+plot_model_metric = function(predictions, model_metrics, truth_label, color){
+  annotation = paste(model_metrics[['.metric']],
+                     format(round(model_metrics[['.estimate']], 2), digits = 2),
+                     sep = ": ",
+                     collapse = "\n")
+  ggplot(predictions, aes(.data[[truth_label]], `.pred`, color = I(color))) +
+    geom_point(shape = 21) +
+    geom_abline(slope = 1, linetype = 'dashed', color = color) +
+    annotate("text", x = -Inf, y = Inf, color = I(color), label = annotation,
+             hjust = -0.1, vjust = 1.1) +
+    coord_equal() +
+    xlim(c(-16,0)) + ylim(c(-16, 0)) +
+    labs(x = expression(log[2]*Q[true]), y = expression(log[2]*Q[pred]))
+}
+```
+
+Fit Random Forest for each species.
+
+```{r}
+#| fig-asp: 0.4
+#| fig-width: 8
+p_rf_predict = lapply(seq_along(strain_label), function(i){
+  train = data_train |> select(matches(strain_label[[i]]), starts_with("T"))
+  test = data_test  |> select(matches(strain_label[[i]]), starts_with("T"))
+  rec = recipe(as.formula(paste(strain_label[[i]], '.', sep = '~')),
+               data = train)
+
+  fit = workflow() |>
+    add_recipe(rec) |>
+    add_model(rf_spec) |>
+    fit(train)
+
+  prediction = augment(fit, new_data = test)
+
+  metric = prediction |>
+    metrics(truth = strain_label[[i]], estimate = .pred)
+
+  plot_model_metric(prediction, metric, strain_label[[i]], strain_color[[i]])
+})
+
+plot_grid(plotlist = p_rf_predict, ncol = 2, labels = "auto")
+
+ggsave(filename = "figures/figure-new-data-rf.jpg")
+```

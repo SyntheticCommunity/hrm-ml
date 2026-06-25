@@ -20,6 +20,8 @@ book:
     - two-species-modeling.qmd
     - model-optimization.qmd
     - method-evaluation.qmd
+    - new-data-single-species-modeling.qmd
+    - new-data-modeling.qmd
     - references.qmd
 
 bibliography: references.bib
