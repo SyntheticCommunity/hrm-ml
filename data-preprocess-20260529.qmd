@@ -1,0 +1,35 @@
+## Preprocess 2026-05-29 HRM data
+
+Read raw QuantStudio output, process melting curves (80–90°C), and save clean CSV.
+
+```{r}
+library(dplyr)
+library(mcmodel)
+
+# raw QuantStudio file
+filename = "data-raw/modeling-qPCR/2026-05-29 195141.txt"
+all = read_quantstudio(filename)
+
+# plate setting
+plate = read.csv(xfun::magic_path("modeling-plate-labels.csv")) |>
+  mutate(label_E = ifelse(label_E == 0, 1, ifelse(label_E == 16, 0, 1/2^label_E)),
+         label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
+
+sample = plate |> mutate(cycle = 30, rep = 1)
+
+# process melting curves: 80–90°C, step 0.1
+mc = quantstudio2mc(all, primer = "V4", plate = sample) |>
+  filterData(from = 80, to = 90) |>
+  transformData(step = 0.1)
+
+# convert to wide data frame
+data = mc_tbl2wider(mc)
+
+# fix experiment date (instrument clock was wrong: shows 2016 instead of 2026)
+data = data |> mutate(experiment_date = as.Date("2026-05-29"))
+
+head(data)
+
+# save
+write.csv(data, file = "data-clean/20260529.csv", row.names = FALSE)
+```
