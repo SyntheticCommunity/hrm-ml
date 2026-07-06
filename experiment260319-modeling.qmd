@@ -6,13 +6,13 @@ format: html
 editor: source
 ---
 
-使用 2026-03-19 批次数据运行 HRM-ML 完整管道。
+使用 2026-03-19 批次数据运行 HRM-ML 完整管道。孔板布局使用标准稀释编码（$2^{-n}$），梯度矩阵包含两种菌从 0 到 1 的连续比例。熔解曲线在 80–90°C 范围内以 0.1°C 步长均匀插值后转宽表保存。随机森林模型（`ranger` 引擎，1000 棵树）分别对 E. coli 和 P. putida 的丰度进行回归预测。
 
 {{< include global-settings.qmd >}}
 
 ## Data Preprocess
 
-Read plate layout and transform labels to DNA quantities.
+读入孔板布局，将 $2^{-n}$ 编码的稀释倍数转换为相对 DNA 量。0 对应无模板，16 对应纯菌。
 
 ```{r}
 library(dplyr)
@@ -22,7 +22,7 @@ plate = read.csv(xfun::magic_path("modeling-plate-labels.csv")) |>
          label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
 ```
 
-Read the QuantStudio data file (2026-03-19) and process melting curves.
+读取 QuantStudio 原始数据，用 `quantstudio2mc` 提取熔解曲线，在 80–90°C 范围内均匀插值（步长 0.1°C）。
 
 ```{r}
 library(mcmodel)
@@ -39,7 +39,7 @@ mc_new = quantstudio2mc(all, primer = "V4", plate = sample) |>
   transformData(step = 0.1)
 ```
 
-Convert to wide data frame and save.
+将长格式熔解曲线转宽表（温度点作为列），保存至 `data-clean/20260319.csv` 供后续建模使用。
 
 ```{r}
 data_new = mc_tbl2wider(mc_new)
@@ -51,7 +51,7 @@ write.csv(data_new, file = "data-clean/20260319.csv", row.names = FALSE)
 
 ## Random Forest Modelling
 
-Filter to gradient matrix wells and log2-transform targets.
+筛选梯度矩阵孔位，对目标变量做 $\log_2$ 转换后拆分训练/测试集。
 
 ```{r}
 mc_ml_data = read.csv("data-clean/20260319.csv") |>
@@ -63,7 +63,8 @@ data_train = training(data)
 data_test = testing(data)
 ```
 
-Model specifications.
+模型规格：随机森林（1000 棵树，变量重要性基于 impurity）。
+`plot_model_metric` 辅助函数用于绘制预测 vs 真实值散点图并标注 RMSE / $R^2$ / MAE。
 
 ```{r}
 rf_spec = rand_forest(mode = "regression", trees = 1000) |>
@@ -85,7 +86,7 @@ plot_model_metric = function(predictions, model_metrics, truth_label, color){
 }
 ```
 
-Fit Random Forest for each species.
+分别对 E. coli 和 P. putida 训练 RF 模型。每个模型用温度点（`T*` 列）预测对应菌的 $\log_2$ 浓度。
 
 ```{r}
 #| fig-asp: 0.4
