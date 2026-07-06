@@ -20,6 +20,12 @@ book:
     - two-species-modeling.qmd
     - model-optimization.qmd
     - method-evaluation.qmd
+    - experiment260319.qmd
+    - experiment260319-modeling.qmd
+    - experiment260529.qmd
+    - experiment260529-1.qmd
+    - experiment260529-modeling.qmd
+    - experiment-corn-seed.qmd
     - new-data-single-species-modeling.qmd
     - new-data-modeling.qmd
     - references.qmd
