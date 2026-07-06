@@ -22,7 +22,7 @@ Read the new QuantStudio data file and process melting curves.
 library(mcmodel)
 library(stringr)
 
-filename = "data-raw/modeling-qPCR/2026-3-19 222158.txt"
+filename = "data-raw/optimization-tm/2026-3-19 222158.txt"
 quantstudio_raw = read_quantstudio(filename)
 ```
 
@@ -216,7 +216,7 @@ p_model_mc = lapply(seq_along(strain_label), function(i){
 #| fig-cap: Linear modelling and prediction of single species abundance with threshold cycle (Ct) and melting curve features using new qPCR data (2026-03-19).
 plot_grid(plotlist = c(p_amp, p_mc, p_model_ct, p_model_mc),
           align = 'hv',
-          ncol = 4, nrow = 2, labels = 'auto')
+          ncol = 4, nrow = 2, labels = 'auto', rel_heights = 1)
 
 ggsave("figures/figure-new-data-single-species.jpg")
 ```
