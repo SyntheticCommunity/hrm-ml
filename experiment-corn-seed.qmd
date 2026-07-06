@@ -1,0 +1,435 @@
+---
+title: "Corn Seed HRM — 扩增曲线与熔解曲线"
+author: "Chun-Hui Gao"
+date: "2026-06-17"
+format: html
+editor: source
+---
+
+分析玉米种子微生物群落的 qPCR/HRM 数据，观察各孔的扩增曲线和熔解曲线。
+
+```{r}
+#| message: false
+library(tidyverse)
+library(mcmodel)
+library(cowplot)
+```
+
+## 数据导入
+
+```{r}
+raw_file = "data-raw/Corn_seed_HRM/corn_seed_qPCR_data_2026-06-17 234920.txt"
+qs_raw = read_quantstudio(raw_file)
+qs_raw
+```
+
+查看样品分布。
+
+```{r}
+sample_table = read_csv("data-raw/Corn_seed_HRM/Corn_seed_plate.csv") |>
+  rename(sample_name = sample_id)
+sample_table
+```
+
+## 扩增曲线
+
+```{r}
+qs_amp = get_quantstudio_amplication(qs_raw)
+
+# 找出有数据的样品
+well_samples = read_csv("data-raw/Corn_seed_HRM/Corn_seed_plate.csv") |>
+  rename(sample_name = sample_id)
+
+qs_amp = qs_amp |>
+  left_join(well_samples, by = "well_position") |>
+  mutate(sample_name = factor(sample_name))
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+ggplot(qs_amp, aes(cycle, delta_rn, group = well_position, color = sample_name)) +
+  geom_line(alpha = 0.7) +
+  labs(x = "Cycle", y = "ΔRn", title = "Amplification Curves") +
+  theme(legend.position = "none")
+```
+
+
+## 熔解曲线
+
+```{r}
+mc = quantstudio2mc(qs_raw, primer = "V4")
+
+# 查看温度范围
+mc_tbl = mc2tbl(mc)
+cat("Temperature range:", min(mc_tbl$temperature), "-", max(mc_tbl$temperature), "\n")
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+mc_plot = mc_tbl |>
+  left_join(well_samples |> distinct(well_position, sample_name), by = "well_position") |>
+  mutate(sample_name = factor(sample_name))
+
+ggplot(mc_plot, aes(temperature, derivative,
+                    group = well_position, color = sample_name)) +
+  geom_line(alpha = 0.5) +
+  labs(x = "Temperature (°C)", y = "Fluorescence",
+       title = "Melting Curves") +
+  theme(legend.position = "none")
+```
+
+按行分面查看熔解曲线。
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+mc_plot = mc_plot |>
+  mutate(row = str_extract(well_position, "[A-P]"),
+         col = as.numeric(str_extract(well_position, "\\d+")))
+
+ggplot(mc_plot, aes(temperature, derivative,
+                    group = well_position, color = sample_name)) +
+  geom_line(alpha = 0.5, linewidth = 0.3) +
+  facet_grid(col ~ row) +
+  labs(x = "Temperature (°C)", y = "Fluorescence",
+       title = "Melting Curves by Row") +
+  theme(legend.position = "none")
+```
+
+## 样本间 HRM 曲线距离
+
+计算 261 个样本间全熔解曲线欧氏距离，反映样本间 HRM 指纹差异。
+
+```{r}
+#| warning: false
+
+# ── 1. 宽表转换 ──
+# mc_tbl 是长格式：每个样品 × 每个温度点为一行，一行仅一个 (temperature, derivative) 对。
+# dist() 要求输入为 样品×变量 矩阵，因此需要 pivot_wider 将温度点展开为列，
+# 每个样品变成一行、每个温度点一列，形如：
+#     well_position | T_80.0 | T_80.1 | ... | T_90.0
+mc_wide = mc_tbl |>
+  left_join(well_samples, by = "well_position") |>
+  # 归一化：将每条曲线的 derivative 除以其最大值，使曲线在 [0, 1] 范围。
+  # 这样计算的距离反映的是曲线形态（形状）的差异而非荧光绝对值的差异，
+  # 因为同一样品不同浓度下荧光强度可能不同，但曲线形态应相似。
+  mutate(normalized = derivative / max(derivative), .by = well_position) |>
+  select(sample_name, well_position, temperature, normalized) |>
+  # 以 well_position 为唯一标识（NTC/NPC 在多孔中重复出现），将温度点展开为列
+  pivot_wider(id_cols = c(sample_name, well_position),
+              names_from = temperature, values_from = normalized,
+              names_glue = "T_{temperature}")
+
+# ── 2. 重复孔合并 ──
+# 同一个 sample_name 可能出现在多个孔位（如 NTC 出现在 A23、B23…K23），
+# 将它们的归一化曲线取均值，合并为一条代表性曲线，避免重复样本扭曲距离。
+mc_mat = mc_wide |>
+  summarise(across(starts_with("T"), mean), .by = sample_name) |>
+  column_to_rownames("sample_name") |>
+  as.matrix()
+
+# ── 3. 距离矩阵 ──
+# 欧氏距离 (Euclidean distance)：将每个样本的熔解曲线视为高维空间中的一个点，
+# 两点间距离 = sqrt(sum((T_i - T_j)^2))，值越小表示曲线越相似。
+# 选择欧氏距离是因为归一化后的曲线各温度点独立且等距，符合欧氏几何直觉。
+dist_mat = mc_mat |> dist(method = "euclidean")
+
+# ── 4. 层次聚类 ──
+# Ward 方差最小化法：每一步合并两个簇时，使合并后的组内离差平方和增量最小。
+# 相比 single/complete linkage，Ward 倾向于产生大小更均衡的簇，
+# 适合探索样本间的自然分组结构。
+hc = hclust(dist_mat, method = "ward.D2")
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+#| label: fig-dendrogram-corn-seed
+
+# 绘制树状图。
+# labels = FALSE 隐藏 261 个样本名标签（太密集无法阅读），
+# 仅展示聚类拓扑结构和分支距离。如需查看特定样本的分组，
+# 可结合 cutree(hc, k = N) 提取 N 个簇的成员归属。
+plot(hc, labels = FALSE, main = "HRM Melting Curve Dendrogram (Ward + Euclidean)",
+     xlab = "Samples (n = 261)", sub = "", ylab = "Distance")
+# 三宽线条提示：横轴跨度大，说明样品间 HRM 曲线形态差异显著，
+# 可能对应不同的微生物群落组成。
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 14
+#| fig-height: 10
+#| label: fig-heatmap-corn-seed
+library(pheatmap)
+
+# ── 温度点筛选 ──
+# 261 个样本在 80–90°C 范围内约有 100+ 个温度点，其中一些温度点在所有样本中
+# 几乎没有变化（方差接近 0），这些温度点对距离区分贡献很小且增加计算噪声。
+# 策略：先用 where(~ sd(.x) > 0) 剔除完全无变化的列，再按方差降序取前 200 个
+# 温度点。200 这个阈值在保留区分能力和抑制噪声之间取得平衡。
+mc_viz = mc_mat |>
+  as.data.frame() |>
+  select(where(~ sd(.x) > 0))
+top_cols = names(mc_viz)[order(sapply(mc_viz, var), decreasing = TRUE)[1:min(200, ncol(mc_viz))]]
+mc_viz = mc_viz |> select(all_of(top_cols))
+
+# ── 热图绘制 ──
+# pheatmap 自动完成行（样本）和列（温度点）的层次聚类，并排列为树状图。
+# clustering_distance_rows = "euclidean" 与前面 dist(method = "euclidean")一致，
+# clustering_method = "ward.D2" 与前面 hclust 保持一致，使行聚类结构与
+# 上面的树状图一致。
+# show_rownames / show_colnames = FALSE：261 × 200 的标签无法在图中阅读，
+# 隐藏它们以获得干净的色块图，聚焦于聚类簇的整体模式。
+pheatmap(mc_viz,
+         clustering_distance_rows = "euclidean",
+         clustering_method = "ward.D2",
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         treeheight_row = 150,
+         main = "HRM Melting Curve Similarity among 261 Samples")
+# 解读：热图中横向的深色/浅色条带反映了样本簇间熔解曲线形态的系统性差异。
+# 如果样本按某种分组（如品种、处理）呈现清晰的色块结构，说明 HRM 信号能区分
+# 这些分组；反之，若颜色随机分布，则样本间 HRM 指纹差异与实验分组无关。
+```
+
+## 扩增子测序与 HRM 距离的比较
+
+部分样品进行了 16S rRNA 基因 V4 区扩增子测序。以下将扩增子测序（ASV 表）
+计算的群落间 Bray-Curtis 距离与 HRM 熔解曲线欧氏距离进行比较。
+
+```{r}
+#| warning: false
+#| message: false
+
+library(vegan)
+
+# ── 1. 读取 ASV 表并筛选 DLN 样品 ──
+# ASV 表第一列为样品名，其余列为各 ASV 的原始 read count。
+# 第一列在 TSV 中没有列名（第一个字段为空），read_tsv 会赋予默认名。
+asv_raw = read_tsv("data-raw/Corn_seed_HRM/asv-table-rawcount.txt",
+                    col_types = cols())
+first_col = colnames(asv_raw)[1]
+asv_raw = asv_raw |> column_to_rownames(first_col)
+
+# 孔板中非对照样品名
+plate_samples = read_csv("data-raw/Corn_seed_HRM/Corn_seed_plate.csv",
+                          col_types = cols()) |>
+  filter(!sample_id %in% c("NTC", "NPC")) |>
+  pull(sample_id) |>
+  unique()
+
+# ASV 表中 DLN 样品（孔板中对应的）
+asv_shared = asv_raw[rownames(asv_raw) %in% plate_samples, ]
+cat("扩增子测序样品数:", nrow(asv_shared), "\n")
+
+# ── 2. 去除稀有 ASV ──
+# 只在少数样品中出现的 ASV 会引入噪声。保留在 >= 3 个样品中出现、
+# 且所有样品总丰度 >= 10 的 ASV。同时计算相对丰度（转为比例）。
+asv_clean = asv_shared |>
+  select(where(~ sum(.x > 0) >= 3 & sum(.x) >= 10))
+
+cat("ASV 过滤后:", ncol(asv_clean), "(从", ncol(asv_shared), ")\n")
+
+# 转为相对丰度。
+# decostand(method = "total") 将每行的总和标准化为 1，
+# 返回 matrix 且保留行名。
+asv_rel = asv_clean |> as.matrix() |> decostand(method = "total")
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+# ── 3. ASV 群落距离：Bray-Curtis ──
+# Bray-Curtis 距离是群落生态学中最常用的差异度量，值域 [0, 1]。
+# 0 = 两个样品共享完全相同的 ASV 组成，1 = 完全无重叠。
+# 相比欧氏距离，Bray-Curtis 不受联合缺失（double-zeros）的膨胀，
+# 更适合稀疏的群落数据。
+bc_dist = vegdist(asv_rel, method = "bray")
+cat("Bray-Curtis 距离矩阵维度:", attr(bc_dist, "Size"), "\n")
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+# ── 4. HRM 距离（同样品子集） ──
+# 从前面计算的 mc_mat 中提取与扩增子测序共有的样品。
+# 注意：mc_tbl 的长格式转换已经在前面完成，这里直接从 mc_mat 取子集。
+# 如果 mc_mat 在当前环境中不可用，说明代码单独运行时需要重新计算；
+# 这里用条件判断确保不会中断。
+if (!exists("mc_mat")) {
+  mc_tbl_local = mc_tbl
+  well_samples_local = well_samples
+  mc_wide_local = mc_tbl_local |>
+    left_join(well_samples_local, by = "well_position") |>
+    mutate(normalized = derivative / max(derivative), .by = well_position) |>
+    select(sample_name, well_position, temperature, normalized) |>
+    pivot_wider(id_cols = c(sample_name, well_position),
+                names_from = temperature, values_from = normalized,
+                names_glue = "T_{temperature}")
+  mc_mat_local = mc_wide_local |>
+    summarise(across(starts_with("T"), mean), .by = sample_name) |>
+    column_to_rownames("sample_name") |>
+    as.matrix()
+} else {
+  mc_mat_local = mc_mat
+}
+
+# 取共有样品的子集（bc_dist 来自前一个代码块）
+common_samples = intersect(rownames(mc_mat_local), attr(bc_dist, "Labels"))
+cat("共有样品数:", length(common_samples), "\n")
+
+mc_shared = mc_mat_local[common_samples, ]
+# 计算 HRM 欧氏距离
+hrm_dist = dist(mc_shared, method = "euclidean")
+
+# 转为与 Bray-Curtis 同样品顺序的 dist 对象
+bc_sub = vegdist(as.matrix(asv_rel[common_samples, ]), method = "bray")
+```
+
+<br>
+
+- 第 1 步（表格数据略）：读取 ASV 表 → 筛选 DLN 样品 → 过滤稀有 ASV → 计算相对丰度
+
+```{r}
+#| warning: false
+#| message: false
+# Display the filtered ASV table summary
+cat("Filtered ASV table:", nrow(asv_shared), "samples,", ncol(asv_clean), "ASVs\n")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+#| label: fig-mantel-test
+
+# ── 5. Mantel 检验 ──
+# Mantel 检验评估两个距离矩阵之间的相关性（Spearman 秩相关）。
+# H0：两个距离矩阵之间无相关关系。
+# 若显著正相关，说明 HRM 信号能反映群落组成的差异。
+mantel_result = mantel(bc_sub, hrm_dist, method = "spearman",
+                       permutations = 9999)
+
+cat("Mantel test: r =", round(mantel_result$statistic, 4),
+    ", p =", mantel_result$signif, "\n")
+
+# ── 6. 散点图：配对距离比较 ──
+# 将两个距离矩阵的下三角向量化，逐对比较。
+bc_vec = as.vector(bc_sub)
+hrm_vec = as.vector(hrm_dist)
+
+# 由于对称矩阵的下三角有重复，取一半即可
+n = length(common_samples)
+n_pairs = n * (n - 1) / 2
+# as.vector 已经取了上三角（dist 的默认行为），长度就是 n_pairs
+
+plot_df = data.frame(
+  bray_curtis = bc_vec,
+  euclidean = hrm_vec
+)
+
+# 拟合线性回归
+lm_fit = lm(euclidean ~ bray_curtis, data = plot_df)
+r2 = summary(lm_fit)$r.squared
+
+ggplot(plot_df, aes(bray_curtis, euclidean)) +
+  geom_point(alpha = 0.3, size = 0.8, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red3", linewidth = 0.6) +
+  annotate("text", x = max(plot_df$bray_curtis) * 0.7,
+           y = max(plot_df$euclidean) * 0.95,
+           label = paste0("Spearman r = ", round(mantel_result$statistic, 3),
+                          "\np = ", mantel_result$signif,
+                          "\nR² = ", round(r2, 3)),
+           hjust = 0, size = 3.5) +
+  labs(x = "Bray-Curtis distance (16S ASV)",
+       y = "Euclidean distance (HRM curve)",
+       title = paste0("HRM vs. 16S Amplicon Distance (n = ",
+                      length(common_samples), " samples)"))
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 14
+#| fig-height: 10
+#| label: fig-asv-heatmap
+
+# ── 7. 群落组成热图 ──
+# 按 HRM 聚类结果排列样品，展示各样品中主要 ASV 的相对丰度，
+# 直观比较 HRM 聚类与群落组成的一致性。
+#
+# 策略：选取在各样品中平均相对丰度最高的 30 个 ASV，
+# 列（样品）按 HRM 层次聚类的顺序排列。
+
+# 平均相对丰度最高的 ASV
+top_asvs = names(sort(colSums(asv_rel[common_samples, ]),
+                       decreasing = TRUE)[1:30])
+asv_top = asv_rel[common_samples, top_asvs]
+
+# 读取分类信息，给 ASV 加上物种注释
+tax = read_tsv("data-raw/Corn_seed_HRM/tax-table.txt", col_types = cols())
+rownames(tax) = tax[[1]]
+
+# 生成标签：ASV 最后4位 + Genus_Species（如果有）
+tax_label = sapply(top_asvs, function(a) {
+  if (a %in% rownames(tax)) {
+    g = tax[a, "Genus"]
+    s = tax[a, "Species"]
+    short = substr(a, nchar(a)-3, nchar(a))
+    if (!is.na(s) && s != "NA") {
+      paste0(short, " ", g, "_", s)
+    } else if (!is.na(g) && g != "NA") {
+      paste0(short, " ", g, "_sp")
+    } else {
+      paste0(short, " unclassified")
+    }
+  } else {
+    substr(a, nchar(a)-3, nchar(a))
+  }
+})
+
+colnames(asv_top) = tax_label
+# 用 asv_top 里的样品名作为行名，保持与 hc 类聚一致
+# 对列（ASV）也聚类
+pheatmap(t(asv_top),
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "ward.D2",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize_row = 7,
+         treeheight_row = 50,
+         treeheight_col = 100,
+         main = "Top 30 ASV Relative Abundance")
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 10
+#| fig-height: 6
+#| label: fig-pcoa
+
+# ── 8. PCoA 可视化 ──
+# 主坐标分析（PCoA）将 Bray-Curtis 距离映射到低维空间，便于观察
+# 样品间的群落结构关系。点的距离越近，群落组成越相似。
+pcoa = cmdscale(bc_sub, eig = TRUE, k = 2)
+var_exp = round(pcoa$eig[1:2] / sum(pcoa$eig[pcoa$eig > 0]) * 100, 1)
+
+pcoa_df = data.frame(
+  PCo1 = pcoa$points[, 1],
+  PCo2 = pcoa$points[, 2]
+)
+
+ggplot(pcoa_df, aes(PCo1, PCo2)) +
+  geom_point(alpha = 0.6, size = 1.5, color = "darkgreen") +
+  labs(x = paste0("PCo1 (", var_exp[1], "%)"),
+       y = paste0("PCo2 (", var_exp[2], "%)"),
+       title = "PCoA of 16S ASV Community (Bray-Curtis)") +
+  theme_minimal()
+```
