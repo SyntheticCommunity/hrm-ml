@@ -8,7 +8,7 @@ Reproduce the single-species linear modeling workflow with the new qPCR data fro
 
 ## Data Preprocess
 
-Read plate layout and transform labels to DNA quantities.
+Read plate layout and transform labels to DNA quantities. 梯度矩阵中以 $2^{-n}$ 编码的稀释倍数被转换为实际相对 DNA 量（0 标记为无模板对照，16 标记为纯菌）。
 
 ```{r}
 library(dplyr)
@@ -18,7 +18,7 @@ plate = read.csv(xfun::magic_path("modeling-plate-labels.csv")) |>
          label_P = ifelse(label_P == 0, 1, ifelse(label_P == 16, 0, 1/2^label_P)))
 ```
 
-Read the QuantStudio data file (2026-05-29) and process melting curves.
+读取 QuantStudio 导出文件（2026-05-29），提取 qPCR 原始数据并处理熔解曲线。
 
 ```{r}
 library(mcmodel)
@@ -29,6 +29,8 @@ quantstudio_raw = read_quantstudio(filename)
 ```
 
 ## Amplification plot
+
+提取扩增曲线并按菌株分面可视化。每个菌株的稀释系列用颜色梯度表示 $\log_2(Q)$，虚线标记 Ct 阈值线。
 
 ```{r}
 qs_amplification = get_quantstudio_amplication(quantstudio_raw)
@@ -57,6 +59,8 @@ p_amp = lapply(seq_along(strain_label), function(i){
 ```
 
 ## Melting curve gradient
+
+将原始熔解曲线转换后，在 77–87°C 范围内以 0.1°C 步长均匀插值，分别绘制单菌稀释系列和双菌梯度矩阵的熔解曲线。
 
 ```{r}
 mc = quantstudio2mc(quantstudio_raw, plate = plate, primer = "V4")
@@ -107,6 +111,8 @@ p_mc = lapply(seq_along(strain_label), function(i){
 
 ## Peak calling
 
+提取单菌稀释系列中每孔的熔解峰特征（峰位置、高度、面积、起始、结束）。峰面积通过梯形积分（`pracma::trapz`）在峰边界内计算，与峰高度和位置一起作为后续线性建模的特征。
+
 ```{r}
 mono_mc = lapply(seq_along(strain_label), function(i){
   x = filterData(mc, well_position = strain_single_well[[i]]) |>
@@ -145,6 +151,8 @@ mono_mc = mono_mc |>
 
 ## Ct model of single species
 
+提取 Ct 值并与浓度数据合并，用于建立基于 Ct 值的单菌丰度线性模型。
+
 ```{r}
 qs_results = get_quantstudio_result(quantstudio_raw) |>
   dplyr::select(well_position, ct) |>
@@ -160,6 +168,8 @@ mono_ct = qs_results |>
 ```
 
 ## Comparison of Ct and MC modelling
+
+分别用 Ct 值和熔解峰特征（峰高、峰面积、峰起止温度）训练线性模型，通过训练/测试拆分评估两种方法的预测性能。
 
 ```{r}
 plot_model_metric = function(model, test_data, color){

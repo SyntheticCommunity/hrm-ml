@@ -70,6 +70,35 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="experiment260529-modeling_files/libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
 <link href="experiment260529-modeling_files/libs/bootstrap/bootstrap.min.css" rel="stylesheet" id="quarto-bootstrap" data-mode="light">
 
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN") {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
 
 </head>
 
@@ -110,7 +139,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </header>
 
 
-<p>使用 2026-05-29 批次数据运行 HRM-ML 完整管道（引物不同，Tm 值偏低，温度范围调整为 77–87°C）。</p>
+<p>使用 2026-05-29 批次数据运行 HRM-ML 完整管道。该批次使用不同引物，Tm 值偏低，熔解曲线温度范围调整为 77–87°C。孔板布局与标准稀释编码一致，随机森林模型（<code>ranger</code> 引擎，1000 棵树）分别对 E. coli 和 P. putida 的丰度进行回归预测。</p>
 <section id="global-setting" class="level2">
 <h2 class="anchored" data-anchor-id="global-setting">Global setting</h2>
 <p>Here we load packages and define several frequently used variables.</p>
@@ -146,7 +175,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </section>
 <section id="data-preprocess" class="level2">
 <h2 class="anchored" data-anchor-id="data-preprocess">Data Preprocess</h2>
-<p>Read plate layout and transform labels to DNA quantities.</p>
+<p>读入孔板布局文件，将 <span class="math inline">\(2^{-n}\)</span> 编码的稀释倍数转换为相对 DNA 量。0 对应无模板，16 对应纯菌。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -157,7 +186,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>         <span class="at">label_P =</span> <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_P)))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </details>
 </div>
-<p>Read the QuantStudio data file (2026-05-29) and process melting curves.</p>
+<p>读取 QuantStudio 原始数据（2026-05-29），提取熔解曲线并在 77–87°C 范围内均匀插值（步长 0.1°C）。此温度范围较标准批次（80–90°C）偏低，因引物不同导致扩增产物 Tm 值降低。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -178,7 +207,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <pre><code>Using run end time...</code></pre>
 </div>
 </div>
-<p>Convert to wide data frame and save.</p>
+<p>将长格式熔解曲线转宽表（温度点作为列），保存至 <code>data-clean/20260529.csv</code>。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -212,7 +241,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </section>
 <section id="random-forest-modelling" class="level2">
 <h2 class="anchored" data-anchor-id="random-forest-modelling">Random Forest Modelling</h2>
-<p>Filter to gradient matrix wells and log2-transform targets.</p>
+<p>筛选梯度矩阵孔位，对目标变量做 <span class="math inline">\(\log_2\)</span> 转换后拆分训练/测试集。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -225,7 +254,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>data_test <span class="ot">=</span> <span class="fu">testing</span>(data)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </details>
 </div>
-<p>Model specifications.</p>
+<p>模型规格：随机森林（1000 棵树，变量重要性基于 impurity）。<code>plot_model_metric</code> 辅助函数用于绘制预测 vs 真实值散点图并标注 RMSE / <span class="math inline">\(R^2\)</span> / MAE。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -248,7 +277,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>}</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </details>
 </div>
-<p>Fit Random Forest for each species.</p>
+<p>分别对 E. coli 和 P. putida 训练 RF 模型。每个模型用温度点（<code>T*</code> 列）预测对应菌的 <span class="math inline">\(\log_2\)</span> 浓度。</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
@@ -776,13 +805,13 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="an">editor:</span><span class="co"> source</span></span>
 <span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
 <span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>使用 2026-05-29 批次数据运行 HRM-ML 完整管道（引物不同，Tm 值偏低，温度范围调整为 77–87°C）。</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>使用 2026-05-29 批次数据运行 HRM-ML 完整管道。该批次使用不同引物，Tm 值偏低，熔解曲线温度范围调整为 77–87°C。孔板布局与标准稀释编码一致，随机森林模型（<span class="in">`ranger`</span> 引擎，1000 棵树）分别对 E. coli 和 P. putida 的丰度进行回归预测。</span>
 <span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>{{&lt; include global-settings.qmd &gt;}}</span>
 <span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="fu">## Data Preprocess</span></span>
 <span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>Read plate layout and transform labels to DNA quantities.</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>读入孔板布局文件，将 $2^{-n}$ 编码的稀释倍数转换为相对 DNA 量。0 对应无模板，16 对应纯菌。</span>
 <span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(dplyr)</span>
@@ -792,7 +821,7 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>         <span class="at">label_P =</span> <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_P)))</span>
 <span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>Read the QuantStudio data file (2026-05-29) and process melting curves.</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>读取 QuantStudio 原始数据（2026-05-29），提取熔解曲线并在 77–87°C 范围内均匀插值（步长 0.1°C）。此温度范围较标准批次（80–90°C）偏低，因引物不同导致扩增产物 Tm 值降低。</span>
 <span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mcmodel)</span>
@@ -809,7 +838,7 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transformData</span>(<span class="at">step =</span> <span class="fl">0.1</span>)</span>
 <span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>Convert to wide data frame and save.</span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>将长格式熔解曲线转宽表（温度点作为列），保存至 <span class="in">`data-clean/20260529.csv`</span>。</span>
 <span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a>data_new <span class="ot">=</span> <span class="fu">mc_tbl2wider</span>(mc_new)</span>
@@ -821,7 +850,7 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a><span class="fu">## Random Forest Modelling</span></span>
 <span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>Filter to gradient matrix wells and log2-transform targets.</span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>筛选梯度矩阵孔位，对目标变量做 $\log_2$ 转换后拆分训练/测试集。</span>
 <span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a>mc_ml_data <span class="ot">=</span> <span class="fu">read.csv</span>(<span class="st">"data-clean/20260529.csv"</span>) <span class="sc">|&gt;</span></span>
@@ -833,7 +862,7 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a>data_test <span class="ot">=</span> <span class="fu">testing</span>(data)</span>
 <span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb13-76"><a href="#cb13-76" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a>Model specifications.</span>
+<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a>模型规格：随机森林（1000 棵树，变量重要性基于 impurity）。<span class="in">`plot_model_metric`</span> 辅助函数用于绘制预测 vs 真实值散点图并标注 RMSE / $R^2$ / MAE。</span>
 <span id="cb13-78"><a href="#cb13-78" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-81"><a href="#cb13-81" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-82"><a href="#cb13-82" aria-hidden="true" tabindex="-1"></a>rf_spec <span class="ot">=</span> <span class="fu">rand_forest</span>(<span class="at">mode =</span> <span class="st">"regression"</span>, <span class="at">trees =</span> <span class="dv">1000</span>) <span class="sc">|&gt;</span></span>
@@ -855,7 +884,7 @@ window.document.addEventListener("DOMContentLoaded", function (event) {
 <span id="cb13-98"><a href="#cb13-98" aria-hidden="true" tabindex="-1"></a>}</span>
 <span id="cb13-99"><a href="#cb13-99" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb13-100"><a href="#cb13-100" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a>Fit Random Forest for each species.</span>
+<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a>分别对 E. coli 和 P. putida 训练 RF 模型。每个模型用温度点（<span class="in">`T*`</span> 列）预测对应菌的 $\log_2$ 浓度。</span>
 <span id="cb13-102"><a href="#cb13-102" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-105"><a href="#cb13-105" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
 <span id="cb13-106"><a href="#cb13-106" aria-hidden="true" tabindex="-1"></a><span class="co">#| fig-asp: 0.4</span></span>

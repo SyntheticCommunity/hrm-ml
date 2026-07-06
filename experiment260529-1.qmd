@@ -24,7 +24,6 @@ quantstudio_raw
 读入孔板布局文件，将稀释倍数转化为相对 DNA 量。
 
 ```{r}
-# read plate setting
 plate_file = "data-raw/modeling-qPCR/modeling-plate-labels.csv"
 plate = read.csv(plate_file)
 plate2 = plate |>
@@ -67,7 +66,6 @@ plot_grid(p_concentration[[1]], p_concentration[[2]], p_matrix,
 提取并可视化扩增曲线。
 
 ```{r}
-# plot amplification curve
 qs_amplification = get_quantstudio_amplication(quantstudio_raw)
 ```
 
@@ -101,7 +99,6 @@ plot_grid(plotlist = p_amp, labels = "auto")
 提取软件自动计算的 Ct 值，分析与浓度的相关性。
 
 ```{r}
-# check ct calling results
 qs_results = get_quantstudio_result(quantstudio_raw) |>
   dplyr::select(well_position, ct) |>
   dplyr::mutate(ct = as.numeric(ct)) |>

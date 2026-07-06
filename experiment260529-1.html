@@ -158,13 +158,12 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <h2 class="anchored" data-anchor-id="孔板布局">孔板布局</h2>
 <p>读入孔板布局文件，将稀释倍数转化为相对 DNA 量。</p>
 <div class="cell">
-<div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># read plate setting</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>plate_file <span class="ot">=</span> <span class="st">"data-raw/modeling-qPCR/modeling-plate-labels.csv"</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>plate <span class="ot">=</span> <span class="fu">read.csv</span>(plate_file)</span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>plate2 <span class="ot">=</span> plate <span class="sc">|&gt;</span></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">drop_na</span>() <span class="sc">|&gt;</span></span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">label_E =</span> <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_E)),</span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>         <span class="at">label_P =</span> <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_P)))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+<div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>plate_file <span class="ot">=</span> <span class="st">"data-raw/modeling-qPCR/modeling-plate-labels.csv"</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>plate <span class="ot">=</span> <span class="fu">read.csv</span>(plate_file)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>plate2 <span class="ot">=</span> plate <span class="sc">|&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">drop_na</span>() <span class="sc">|&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">label_E =</span> <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_E)),</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>         <span class="at">label_P =</span> <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_P)))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
 <section id="单菌稀释系列" class="level3">
 <h3 class="anchored" data-anchor-id="单菌稀释系列">单菌稀释系列</h3>
@@ -215,8 +214,7 @@ Figure&nbsp;1: 384 孔板布局：单菌稀释系列与双菌梯度矩阵
 <h2 class="anchored" data-anchor-id="扩增曲线">扩增曲线</h2>
 <p>提取并可视化扩增曲线。</p>
 <div class="cell">
-<div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># plot amplification curve</span></span>
-<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>qs_amplification <span class="ot">=</span> <span class="fu">get_quantstudio_amplication</span>(quantstudio_raw)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+<div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>qs_amplification <span class="ot">=</span> <span class="fu">get_quantstudio_amplication</span>(quantstudio_raw)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>p_amp <span class="ot">=</span> <span class="fu">lapply</span>(<span class="fu">seq_along</span>(strain_label), <span class="cf">function</span>(i){</span>
@@ -261,15 +259,14 @@ Figure&nbsp;2: 单菌稀释系列扩增曲线
 <h2 class="anchored" data-anchor-id="ct-结果">Ct 结果</h2>
 <p>提取软件自动计算的 Ct 值，分析与浓度的相关性。</p>
 <div class="cell">
-<div class="sourceCode cell-code" id="cb12"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># check ct calling results</span></span>
-<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>qs_results <span class="ot">=</span> <span class="fu">get_quantstudio_result</span>(quantstudio_raw) <span class="sc">|&gt;</span></span>
-<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">select</span>(well_position, ct) <span class="sc">|&gt;</span></span>
-<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">mutate</span>(<span class="at">ct =</span> <span class="fu">as.numeric</span>(ct)) <span class="sc">|&gt;</span></span>
-<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(plate2) <span class="sc">|&gt;</span></span>
-<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pivot_longer</span>(<span class="at">cols =</span> <span class="fu">starts_with</span>(<span class="st">"label_"</span>),</span>
-<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>               <span class="at">names_to =</span> <span class="st">"strain"</span>,</span>
-<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>               <span class="at">values_to =</span> <span class="st">"quantity"</span>)  <span class="sc">|&gt;</span></span>
-<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">filter</span>(quantity <span class="sc">!=</span> <span class="dv">0</span>, <span class="sc">!</span><span class="fu">is.na</span>(ct))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+<div class="sourceCode cell-code" id="cb12"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>qs_results <span class="ot">=</span> <span class="fu">get_quantstudio_result</span>(quantstudio_raw) <span class="sc">|&gt;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">select</span>(well_position, ct) <span class="sc">|&gt;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">mutate</span>(<span class="at">ct =</span> <span class="fu">as.numeric</span>(ct)) <span class="sc">|&gt;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(plate2) <span class="sc">|&gt;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pivot_longer</span>(<span class="at">cols =</span> <span class="fu">starts_with</span>(<span class="st">"label_"</span>),</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>               <span class="at">names_to =</span> <span class="st">"strain"</span>,</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>               <span class="at">values_to =</span> <span class="st">"quantity"</span>)  <span class="sc">|&gt;</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">filter</span>(quantity <span class="sc">!=</span> <span class="dv">0</span>, <span class="sc">!</span><span class="fu">is.na</span>(ct))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 <div class="cell-output cell-output-stderr">
 <pre><code>Joining with `by = join_by(well_position)`</code></pre>
 </div>

@@ -68,6 +68,35 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="experiment260529_files/libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
 <link href="experiment260529_files/libs/bootstrap/bootstrap.min.css" rel="stylesheet" id="quarto-bootstrap" data-mode="light">
 
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN") {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
 
 </head>
 
@@ -129,7 +158,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </section>
 <section id="data-preprocess" class="level2">
 <h2 class="anchored" data-anchor-id="data-preprocess">Data Preprocess</h2>
-<p>Read plate layout and transform labels to DNA quantities.</p>
+<p>Read plate layout and transform labels to DNA quantities. 梯度矩阵中以 <span class="math inline">\(2^{-n}\)</span> 编码的稀释倍数被转换为实际相对 DNA 量（0 标记为无模板对照，16 标记为纯菌）。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb2"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(dplyr)</span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
@@ -137,7 +166,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">label_E =</span> <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_E <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_E)),</span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>         <span class="at">label_P =</span> <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">0</span>, <span class="dv">1</span>, <span class="fu">ifelse</span>(label_P <span class="sc">==</span> <span class="dv">16</span>, <span class="dv">0</span>, <span class="dv">1</span><span class="sc">/</span><span class="dv">2</span><span class="sc">^</span>label_P)))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
-<p>Read the QuantStudio data file (2026-05-29) and process melting curves.</p>
+<p>读取 QuantStudio 导出文件（2026-05-29），提取 qPCR 原始数据并处理熔解曲线。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb3"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mcmodel)</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(stringr)</span>
@@ -148,6 +177,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </section>
 <section id="amplification-plot" class="level2">
 <h2 class="anchored" data-anchor-id="amplification-plot">Amplification plot</h2>
+<p>提取扩增曲线并按菌株分面可视化。每个菌株的稀释系列用颜色梯度表示 <span class="math inline">\(\log_2(Q)\)</span>，虚线标记 Ct 阈值线。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>qs_amplification <span class="ot">=</span> <span class="fu">get_quantstudio_amplication</span>(quantstudio_raw)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
@@ -179,6 +209,7 @@ Joining with `by = join_by(well_position)`</code></pre>
 </section>
 <section id="melting-curve-gradient" class="level2">
 <h2 class="anchored" data-anchor-id="melting-curve-gradient">Melting curve gradient</h2>
+<p>将原始熔解曲线转换后，在 77–87°C 范围内以 0.1°C 步长均匀插值，分别绘制单菌稀释系列和双菌梯度矩阵的熔解曲线。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>mc <span class="ot">=</span> <span class="fu">quantstudio2mc</span>(quantstudio_raw, <span class="at">plate =</span> plate, <span class="at">primer =</span> <span class="st">"V4"</span>)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 <div class="cell-output cell-output-stderr">
@@ -230,6 +261,7 @@ Joining with `by = join_by(well_position)`</code></pre>
 </section>
 <section id="peak-calling" class="level2">
 <h2 class="anchored" data-anchor-id="peak-calling">Peak calling</h2>
+<p>提取单菌稀释系列中每孔的熔解峰特征（峰位置、高度、面积、起始、结束）。峰面积通过梯形积分（<code>pracma::trapz</code>）在峰边界内计算，与峰高度和位置一起作为后续线性建模的特征。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb11"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>mono_mc <span class="ot">=</span> <span class="fu">lapply</span>(<span class="fu">seq_along</span>(strain_label), <span class="cf">function</span>(i){</span>
 <span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  x <span class="ot">=</span> <span class="fu">filterData</span>(mc, <span class="at">well_position =</span> strain_single_well[[i]]) <span class="sc">|&gt;</span></span>
@@ -268,6 +300,7 @@ Joining with `by = join_by(well_position)`</code></pre>
 </section>
 <section id="ct-model-of-single-species" class="level2">
 <h2 class="anchored" data-anchor-id="ct-model-of-single-species">Ct model of single species</h2>
+<p>提取 Ct 值并与浓度数据合并，用于建立基于 Ct 值的单菌丰度线性模型。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb12"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>qs_results <span class="ot">=</span> <span class="fu">get_quantstudio_result</span>(quantstudio_raw) <span class="sc">|&gt;</span></span>
 <span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  dplyr<span class="sc">::</span><span class="fu">select</span>(well_position, ct) <span class="sc">|&gt;</span></span>
@@ -286,6 +319,7 @@ Joining with `by = join_by(well_position)`</code></pre>
 </section>
 <section id="comparison-of-ct-and-mc-modelling" class="level2">
 <h2 class="anchored" data-anchor-id="comparison-of-ct-and-mc-modelling">Comparison of Ct and MC modelling</h2>
+<p>分别用 Ct 值和熔解峰特征（峰高、峰面积、峰起止温度）训练线性模型，通过训练/测试拆分评估两种方法的预测性能。</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb15"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>plot_model_metric <span class="ot">=</span> <span class="cf">function</span>(model, test_data, color){</span>
 <span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  predictions <span class="ot">=</span> <span class="fu">augment</span>(model, <span class="at">newdata =</span> test_data)</span>
