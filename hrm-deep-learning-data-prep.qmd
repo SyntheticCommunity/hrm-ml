@@ -1,0 +1,177 @@
+---
+title: "HRM Deep Learning — 数据准备"
+author: "Chun-Hui Gao"
+date: "2026-07-06"
+---
+
+从玉米种子 HRM 数据和 16S ASV 表中提取共有样品，构建样本对数据集，通过 CSV 文件与其他步骤交换数据。
+
+{{< include global-settings.qmd >}}
+
+## 熔解曲线处理
+
+```{r}
+#| warning: false
+#| message: false
+library(mcmodel)
+library(vegan)
+
+# 读取玉米种子 qPCR 数据
+raw_file = "data-raw/Corn_seed_HRM/corn_seed_qPCR_data_2026-06-17 234920.txt"
+qs_raw = read_quantstudio(raw_file)
+mc = quantstudio2mc(qs_raw, primer = "V4")
+
+# 读取孔板布局
+well_samples = read_csv("data-raw/Corn_seed_HRM/Corn_seed_plate.csv",
+                        col_types = cols()) |>
+  rename(sample_name = sample_id)
+
+# 转为宽表（每个样品一行，温度点为列）
+mc_wide = mc |>
+  filterData(from = 80, to = 90) |>
+  transformData(step = 0.1) |>
+  mc_tbl2wider() |>
+  left_join(well_samples, by = "well_position") |>
+  summarise(across(starts_with("T"), mean), .by = sample_name)
+
+cat("HRM 样品数:", nrow(mc_wide), "\n")
+cat("温度特征数:", sum(str_detect(colnames(mc_wide), "^T")), "\n")
+```
+
+## 16S ASV 数据与 Bray-Curtis 距离
+
+```{r}
+#| warning: false
+#| message: false
+# 读取 ASV 表
+asv_raw = read_tsv("data-raw/Corn_seed_HRM/asv-table-rawcount.txt",
+                    col_types = cols())
+first_col = colnames(asv_raw)[1]
+asv_raw = asv_raw |> column_to_rownames(first_col)
+
+# 筛选与 HRM 共有的样品
+common_samples = intersect(rownames(asv_raw), mc_wide$sample_name)
+common_samples = common_samples[!common_samples %in% c("NTC", "NPC")]
+cat("共有样品数:", length(common_samples), "\n")
+
+# 过滤稀有 ASV 并标准化
+asv_shared = asv_raw[common_samples, ]
+asv_clean = asv_shared |>
+  select(where(~ sum(.x > 0) >= 3 & sum(.x) >= 10))
+asv_rel = asv_clean |> as.matrix() |> decostand(method = "total")
+cat("ASV 数:", ncol(asv_rel), "\n")
+
+# 计算 Bray-Curtis 距离矩阵
+bc_dist = vegdist(asv_rel, method = "bray")
+cat("距离矩阵大小:", attr(bc_dist, "Size"), "x", attr(bc_dist, "Size"), "\n")
+
+# 提取 HRM 矩阵（仅共有样品，按距离矩阵顺序）
+hrm_mat = mc_wide |>
+  filter(sample_name %in% common_samples) |>
+  column_to_rownames("sample_name") |>
+  select(starts_with("T")) |>
+  as.matrix()
+hrm_mat = hrm_mat[attr(bc_dist, "Labels"), ]
+stopifnot(all(rownames(hrm_mat) == attr(bc_dist, "Labels")))
+cat("HRM 矩阵:", nrow(hrm_mat), "x", ncol(hrm_mat), "\n")
+```
+
+## 构建样本对数据集
+
+将 $n$ 个样本的距离矩阵展开为 $\binom{n}{2}$ 个样本对，每条记录包含两条熔解曲线和对应的 Bray-Curtis 距离。生成一个包含所有样本对的 CSV：`data-clean/hrm-dl-pairs.csv`。
+
+```{r}
+#| warning: false
+n_samples = length(common_samples)
+pair_indices = combn(n_samples, 2)  # 2 x n_pairs
+
+n_temp = ncol(hrm_mat)
+n_pairs = ncol(pair_indices)
+
+cat("样本对数:", n_pairs, "\n")
+
+# 构建宽表：每个样本对一行
+# 列: pair_id | idx_A | idx_B | sample_A | sample_B | T80 | T80.1 | ... | T90 | bc_distance
+temp_cols = colnames(hrm_mat)
+
+pair_table = data.frame(
+  pair_id   = seq_len(n_pairs),
+  idx_A     = pair_indices[1, ],
+  idx_B     = pair_indices[2, ],
+  sample_A  = rownames(hrm_mat)[pair_indices[1, ]],
+  sample_B  = rownames(hrm_mat)[pair_indices[2, ]],
+  bc_distance = as.numeric(bc_dist)
+)
+
+head(pair_table)
+```
+
+## 导出 HRM 样本矩阵
+
+导出每个样本的完整 HRM 曲线，供嵌入可视化使用。
+
+```{r}
+# 导出样本 × 温度矩阵
+hrm_sample_df = hrm_mat |>
+  as.data.frame() |>
+  rownames_to_column("sample_name")
+
+write_csv(hrm_sample_df, "data-clean/hrm-dl-samples.csv")
+cat("样本矩阵已导出:", nrow(hrm_sample_df), "x", ncol(hrm_sample_df), "\n")
+```
+
+## 导出样本对数据（CSV）
+
+以两个格式导出：
+1. **扁平宽表**（`hrm-dl-pairs-wide.csv`）：每条样本对一行，含 curve_A 和 curve_B 的所有温度列 + bc_distance
+2. **样本对元数据**（`hrm-dl-pairs-meta.csv`）：仅含索引和距离，温度数据从样本矩阵读取
+
+```{r}
+# 格式 1: 扁平宽表
+pair_wide = data.frame(
+  pair_id = seq_len(n_pairs),
+  bc_distance = as.numeric(bc_dist)
+)
+
+# curve A 温度列（加后缀 _A）
+temp_a = hrm_mat[pair_indices[1, ], ]
+colnames(temp_a) = paste0(colnames(temp_a), "_A")
+pair_wide = cbind(pair_wide, temp_a)
+
+# curve B 温度列（加后缀 _B）
+temp_b = hrm_mat[pair_indices[2, ], ]
+colnames(temp_b) = paste0(colnames(temp_b), "_B")
+pair_wide = cbind(pair_wide, temp_b)
+
+write_csv(pair_wide, "data-clean/hrm-dl-pairs-wide.csv")
+cat("样本对宽表已导出:", nrow(pair_wide), "x", ncol(pair_wide), "\n")
+
+# 格式 2: 元数据（仅 id 和距离）
+pair_meta = data.frame(
+  pair_id    = seq_len(n_pairs),
+  idx_A      = pair_indices[1, ],
+  idx_B      = pair_indices[2, ],
+  bc_distance = as.numeric(bc_dist)
+)
+write_csv(pair_meta, "data-clean/hrm-dl-pairs-meta.csv")
+cat("样本对元数据已导出:", nrow(pair_meta), "x", ncol(pair_meta), "\n")
+```
+
+## 导出 Bray-Curtis 完整距离矩阵
+
+供 Triplet 方法构建三元组使用。
+
+```{r}
+bc_full_mat = as.matrix(bc_dist)
+write.csv(bc_full_mat, "data-clean/hrm-dl-bc-dist.csv")
+cat("BC 距离矩阵已导出:", nrow(bc_full_mat), "x", ncol(bc_full_mat), "\n")
+```
+
+数据准备工作完成。输出文件：
+
+| 文件 | 内容 |
+|------|------|
+| `data-clean/hrm-dl-samples.csv` | 样本 × 温度点矩阵 |
+| `data-clean/hrm-dl-pairs-wide.csv` | 样本对扁平宽表（curve_A + curve_B + distance） |
+| `data-clean/hrm-dl-pairs-meta.csv` | 样本对元数据（索引 + 距离） |
+| `data-clean/hrm-dl-bc-dist.csv` | 完整 BC 距离矩阵 |

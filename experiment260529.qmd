@@ -228,6 +228,4 @@ p_model_mc = lapply(seq_along(strain_label), function(i){
 plot_grid(plotlist = c(p_amp, p_mc, p_model_ct, p_model_mc),
           align = 'hv',
           ncol = 4, nrow = 2, labels = 'auto', rel_heights = 1)
-
-ggsave("figures/figure-exp-260529-single-species.jpg")
 ```

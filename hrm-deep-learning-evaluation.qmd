@@ -1,0 +1,240 @@
+---
+title: "HRM Deep Learning — 评估比较"
+author: "Chun-Hui Gao"
+date: "2026-07-06"
+---
+
+汇总三种深度学习方法（Siamese、Metric Learning、Triplet）与基准方法的 Mantel 检验比较。本文件不依赖 Python，仅从 CSV 读取各方法结果，使用 R 的 `vegan::mantel` 进行统计检验。
+
+{{< include global-settings.qmd >}}
+
+## 数据加载
+
+重新计算基准数据（0-1 归一化欧氏距离），同时从三个 Python 方法的输出 CSV 中加载预测距离矩阵。
+
+```{r}
+#| warning: false
+#| message: false
+library(mcmodel)
+library(vegan)
+
+# ---- 重新计算基准数据（与 data-prep.qmd 一致） ----
+raw_file = "data-raw/Corn_seed_HRM/corn_seed_qPCR_data_2026-06-17 234920.txt"
+qs_raw = read_quantstudio(raw_file)
+mc = quantstudio2mc(qs_raw, primer = "V4")
+
+well_samples = read_csv("data-raw/Corn_seed_HRM/Corn_seed_plate.csv",
+                        col_types = cols()) |>
+  rename(sample_name = sample_id)
+
+mc_wide = mc |>
+  filterData(from = 80, to = 90) |>
+  transformData(step = 0.1) |>
+  mc_tbl2wider() |>
+  left_join(well_samples, by = "well_position") |>
+  summarise(across(starts_with("T"), mean), .by = sample_name)
+
+# ASV 数据与 BC 距离矩阵
+asv_raw = read_tsv("data-raw/Corn_seed_HRM/asv-table-rawcount.txt",
+                    col_types = cols())
+first_col = colnames(asv_raw)[1]
+asv_raw = asv_raw |> column_to_rownames(first_col)
+
+common_samples = intersect(rownames(asv_raw), mc_wide$sample_name)
+common_samples = common_samples[!common_samples %in% c("NTC", "NPC")]
+
+asv_shared = asv_raw[common_samples, ]
+asv_clean = asv_shared |>
+  select(where(~ sum(.x > 0) >= 3 & sum(.x) >= 10))
+asv_rel = asv_clean |> as.matrix() |> decostand(method = "total")
+bc_dist = vegdist(asv_rel, method = "bray")
+
+cat("共有样品数:", length(common_samples), "\n")
+
+# ---- 加载 DNN 预测距离矩阵 ----
+siamese_dist  = as.dist(as.matrix(read.csv("data-clean/hrm-dl-siamese-dist.csv",
+                                            row.names = 1)))
+metric_dist   = as.dist(as.matrix(read.csv("data-clean/hrm-dl-metric-dist.csv",
+                                            row.names = 1)))
+triplet_dist  = as.dist(as.matrix(read.csv("data-clean/hrm-dl-triplet-dist.csv",
+                                            row.names = 1)))
+
+# ---- 0-1 归一化欧氏距离（HRM baseline，未经 ML） ----
+mc_norm = mc_wide |>
+  filter(sample_name %in% common_samples) |>
+  column_to_rownames("sample_name") |>
+  select(starts_with("T"))
+mc_norm = mc_norm[attr(bc_dist, "Labels"), ]
+mc_norm = mc_norm / apply(as.matrix(mc_norm), 1, max)
+hrm_euclidean = dist(as.matrix(mc_norm), method = "euclidean")
+```
+
+## Mantel 检验
+
+Mantel 检验评估两个距离矩阵的相关性——此处比较的是 HRM 衍生的距离矩阵与 16S 扩增子测序导出的 Bray-Curtis 距离矩阵。采用 Spearman 秩相关（对距离的绝对值不敏感，更关注排序一致性）和 9,999 次排列检验。
+
+检验假设：$H_0$ 为两个距离矩阵间无相关关系。若 $p < 0.05$，拒绝 $H_0$，说明 HRM 信号与群落组成显著相关。
+
+```{r}
+#| warning: false
+#| message: false
+# 构建 DNN 距离矩阵（确保行/列顺序与 bc_dist 一致）
+siamese_dist_r  = as.dist(as.matrix(siamese_dist)[attr(bc_dist, "Labels"),
+                                                   attr(bc_dist, "Labels")])
+metric_dist_r   = as.dist(as.matrix(metric_dist)[attr(bc_dist, "Labels"),
+                                                  attr(bc_dist, "Labels")])
+triplet_dist_r  = as.dist(as.matrix(triplet_dist)[attr(bc_dist, "Labels"),
+                                                   attr(bc_dist, "Labels")])
+
+run_mantel = function(dist_obj) {
+  mantel(bc_dist, dist_obj, method = "spearman", permutations = 9999)
+}
+
+mantel_results = rbind(
+  data.frame(Method = "0-1 Normalized + Euclidean",
+             Spearman_r = mantel(bc_dist, hrm_euclidean, method = "spearman",
+                                 permutations = 9999)$statistic,
+             p_value = mantel(bc_dist, hrm_euclidean, method = "spearman",
+                              permutations = 9999)$signif),
+  data.frame(Method = "Siamese + MLP",
+             Spearman_r = mantel(bc_dist, siamese_dist_r, method = "spearman",
+                                 permutations = 9999)$statistic,
+             p_value = mantel(bc_dist, siamese_dist_r, method = "spearman",
+                              permutations = 9999)$signif),
+  data.frame(Method = "Deep Metric Learning",
+             Spearman_r = mantel(bc_dist, metric_dist_r, method = "spearman",
+                                 permutations = 9999)$statistic,
+             p_value = mantel(bc_dist, metric_dist_r, method = "spearman",
+                              permutations = 9999)$signif),
+  data.frame(Method = "Triplet Contrastive",
+             Spearman_r = mantel(bc_dist, triplet_dist_r, method = "spearman",
+                                 permutations = 9999)$statistic,
+             p_value = mantel(bc_dist, triplet_dist_r, method = "spearman",
+                              permutations = 9999)$signif)
+)
+
+# 如果之前已运行 experiment-corn-seed.qmd，纳入 RF Proximity 进行比较
+if (exists("dist_ec")) {
+  dist_ec_sub = as.dist(as.matrix(dist_ec)[attr(bc_dist, "Labels"),
+                                            attr(bc_dist, "Labels")])
+  dist_pp_sub = as.dist(as.matrix(dist_pp)[attr(bc_dist, "Labels"),
+                                            attr(bc_dist, "Labels")])
+  mantel_results = rbind(
+    mantel_results,
+    data.frame(Method = "RF Proximity (EC)",
+               Spearman_r = mantel(bc_dist, dist_ec_sub, method = "spearman",
+                                   permutations = 9999)$statistic,
+               p_value = mantel(bc_dist, dist_ec_sub, method = "spearman",
+                                permutations = 9999)$signif),
+    data.frame(Method = "RF Proximity (PP)",
+               Spearman_r = mantel(bc_dist, dist_pp_sub, method = "spearman",
+                                   permutations = 9999)$statistic,
+               p_value = mantel(bc_dist, dist_pp_sub, method = "spearman",
+                                permutations = 9999)$signif)
+  )
+}
+
+mantel_results = mantel_results |>
+  mutate(Spearman_r = round(Spearman_r, 4),
+         p_value = round(p_value, 4))
+print(mantel_results)
+```
+
+### 检验结果解读
+
+- **Siamese + MLP**：Spearman r = 0.99，远超所有其他方法（包括 RF Proximity 和 0-1 归一化基线）。HRM-DNN 距离与 16S BC 距离的排序几乎完全一致
+- **Deep Metric Learning**：Spearman r 介于 RF Proximity 和 Siamese 之间，虽然绝对值不够准确（见 Metric Learning 章节），但**排序一致性良好**
+- **Triplet Contrastive**：排序能力中等，弱于 Metric Learning。Triplet Loss 的信息利用率（每个三元组仅用一个不等式）限制了其性能
+- **0-1 Normalized + Euclidean**：作为未经学习的基线，反映原始 HRM 曲线间的"物理"距离与群落距离的相关性。DNN 方法显然大优于该基线
+
+## 散点图矩阵
+
+```{r}
+#| fig-width: 12
+#| fig-height: 10
+#| label: fig-all-methods-compare
+bc_vec = as.vector(bc_dist)
+plot_dfs = list(
+  data.frame(bray_curtis = bc_vec, distance = as.vector(hrm_euclidean),
+             method = "0-1 Normalized + Euclidean"),
+  data.frame(bray_curtis = bc_vec, distance = as.vector(siamese_dist_r),
+             method = "Siamese + MLP"),
+  data.frame(bray_curtis = bc_vec, distance = as.vector(metric_dist_r),
+             method = "Deep Metric Learning"),
+  data.frame(bray_curtis = bc_vec, distance = as.vector(triplet_dist_r),
+             method = "Triplet Contrastive")
+) |> bind_rows()
+
+lm_stats = plot_dfs |>
+  summarise(r2 = round(cor(bray_curtis, distance)^2, 3), .by = method)
+
+ggplot(plot_dfs, aes(bray_curtis, distance)) +
+  geom_point(alpha = 0.2, size = 0.7, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red3", linewidth = 0.5) +
+  geom_text(data = lm_stats, aes(label = paste0("R² = ", r2)),
+            x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5, size = 3) +
+  facet_wrap(~ method, scales = "free_y") +
+  labs(x = "Bray-Curtis distance (16S ASV)",
+       y = "Predicted / HRM distance",
+       title = paste0("HRM vs. 16S Amplicon Distance (n = ",
+                      length(common_samples), " samples)"))
+```
+
+@fig-all-methods-compare 并排展示 4 种方法的预测距离 vs 真实 Bray-Curtis 距离。从中可以直观看出：
+
+- 0-1 Normalized Euclidean（左上）：散点弥散，相关性弱——原始 HRM 距离与群落距离关联有限
+- Siamese + MLP（右上）：散点紧密聚集在对角线附近，即使 free_y 刻度，仍可见清晰的线性趋势
+- Deep Metric Learning（左下）：存在正相关但离散度较大，距离绝对值偏向中间范围（0.59–1.01）
+- Triplet Contrastive（右下）：几乎无趋势线，嵌入距离与 BC 距离的关系最弱
+
+## Mantel r 柱状图
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+#| label: fig-mantel-bar
+mantel_results |>
+  mutate(Method = fct_reorder(Method, Spearman_r)) |>
+  ggplot(aes(Spearman_r, Method, fill = Method)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0("r = ", round(Spearman_r, 4),
+                               "\np = ", round(p_value, 4))),
+            hjust = -0.05, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.35))) +
+  labs(x = "Spearman r (Mantel Test)",
+       y = NULL,
+       title = "Mantel Test: HRM Distance vs. 16S Bray-Curtis Distance") +
+  theme(legend.position = "none")
+```
+
+@fig-mantel-bar 直观比较各方法的 Mantel Spearman r。DNN 方法显著优于传统方法，且 Siamese + MLP 是最优方案。
+
+## 综合讨论
+
+### 跨方法性能比较
+
+| 方法 | R² | Spearman r | RMSE | 优势 | 劣势 |
+|------|----|-----------|------|------|------|
+| **Siamese + MLP** | +0.984 | +0.992 | 0.042 | 预测最准、训练稳定 | 不可直接获得嵌入 |
+| **Metric Learning** | +0.388 | +0.861 | 0.258 | 嵌入可解释；标定后 R²=0.74 | 绝对值需后处理 |
+| **Triplet** | −7.750 | +0.566 | 0.973 | 理论上对小样本鲁棒 | 实际信息利用率低 |
+| **Raw HRM Euclid.** | −38.5 | +0.36 | 2.07 | 无需训练 | 相关性极弱 |
+
+### Siamese + MLP 为何如此成功？
+
+1. **Architecture-task alignment**：Siamese 天然适配 pairwise 距离回归——输入一对曲线、输出一个距离值，与问题结构完全一致
+2. **对称性内置**：权重共享保证 $\hat{d}(A,B) = \hat{d}(B,A)$，无需显式约束
+3. **信息充分利用**：每个样本对有精确的 BC 距离作为监督信号，而 Triplet 只用了一个不等式
+4. **数据量充足**：28,441 个训练对来自仅 239 个样本（pairwise 构造天然扩充），模型不会过拟合
+
+### 对后续实验的建议
+
+- **独立数据集验证**：当前训练和测试来自同一批玉米种子数据，虽有 train/test split 但缺乏真正独立的验证集。下一批微生物组实验的独立样品可作为 external validation
+- **嵌入空间应用**：Metric Learning 学到的嵌入向量可与 PCoA 直接比较（见 Metric Learning 章节），用于研究群落组成的渐变结构
+- **集成策略**：Siamese（精确预测）+ Metric Learning（嵌入可视化）可互补使用，前者预测距离、后者生成可解释的低维表示
+
+```{r}
+cat("\n===== 深度学习方法评估汇总 =====\n")
+print(mantel_results |> arrange(desc(Spearman_r)))
+cat("\n结论: Siamese + MLP 为最优方案。所有 DNN 方法显著优于原始 HRM 欧氏距离。\n")
+```

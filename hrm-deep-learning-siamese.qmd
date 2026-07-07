@@ -1,0 +1,192 @@
+---
+title: "HRM Deep Learning — Siamese Network"
+author: "Chun-Hui Gao"
+date: "2026-07-06"
+jupyter: hrm-dl
+---
+
+## 方法原理
+
+Siamese Network（孪生网络）核心思想是**权重共享**：两个相同的编码器分别处理一对熔解曲线 $x_A, x_B \in \mathbb{R}^{n}$（$n \approx 100$ 个温度点），输出各自的低维嵌入向量 $z_A, z_B \in \mathbb{R}^{d}$，合并后回归 Bray-Curtis 距离：
+
+$$\hat{d}(x_A, x_B) = \mathbf{g}([ z_A \parallel z_B \parallel |z_A - z_B| ])$$
+
+其中 $\parallel$ 表示向量拼接，$\mathbf{g}$ 是多层感知机回归器。对称设计保证 $\hat{d}(A,B) = \hat{d}(B,A)$，无需显式约束。
+
+### 为何选择 MLP 而非 1D-CNN？
+
+本数据集的温度点约 100 维，属于中等维度的稠密向量。实践中发现：
+
+- **1D-CNN** 对归一化和 batch size 高度敏感，在 MPS/CPU 上容易因 `BatchNorm1d` 导致梯度爆炸
+- **MLP** 参数更少、训练更稳定，配合 z-score 标准化和梯度裁剪即可达到同等表达能力
+- 1D-CNN 的局部感受野优势在 $\mathbin{\sim}100$ 维的输入上不显著
+
+本实验最终采用三层 MLP（$n \to 128 \to 64 \to 32$）作为编码器。
+
+### 训练策略关键点
+
+先前版本的训练崩溃（R² = −3，预测恒为常数）暴露了三个关键问题，均已修复：
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| 训练发散 → NaN loss | 输入未标准化，导数跨 $[-0.004, 2.12]$ | `z-score` 按温度点标准化 |
+| 预测范围不变 | 目标值未标准化，回归输出无约束 | `z-score` 标准化 $y$，预测后逆变换 |
+| loss 震荡不收敛 | Adam + ReduceLROnPlateau 响应慢 | AdamW + CosineAnnealingWarmRestarts + 梯度裁剪 |
+
+```{python}
+#| warning: false
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from sklearn.model_selection import train_test_split
+
+from hrm_deep_learning_utils import (
+    fit_scaler, fit_y_scaler, NormalizedPairDataset,
+    train_regression_model, predict_all, build_pred_dist_matrix
+)
+
+torch.manual_seed(42); np.random.seed(42)
+device = torch.device('cpu')
+print(f"Device: {device}")
+```
+
+## 数据
+
+239 个玉米种子样品的 HRM 熔解曲线与 16S ASV 计算得的 Bray-Curtis（BC）距离矩阵，展开为 $\binom{239}{2} = 28{,}441$ 个样本对。每条样本对包含两条熔解曲线的温度点向量（各约 100 维）和对应的 BC 距离值。数据来自 `hrm-deep-learning-data-prep.qmd` 导出的 CSV 文件。
+
+```{python}
+pw = pd.read_csv("data-clean/hrm-dl-pairs-wide.csv")
+pm = pd.read_csv("data-clean/hrm-dl-pairs-meta.csv")
+ss = pd.read_csv("data-clean/hrm-dl-samples.csv")
+
+cols_a = [c for c in pw.columns if c.endswith("_A")]
+cols_b = [c for c in pw.columns if c.endswith("_B")]
+n_temp = len(cols_a)
+
+X = np.zeros((len(pw), 2, n_temp), dtype=np.float32)
+X[:,0,:] = pw[cols_a].values; X[:,1,:] = pw[cols_b].values
+y_raw = pw["bc_distance"].values.astype(np.float32)
+sample_names = ss["sample_name"].values
+n_samples = len(sample_names)
+print(f"样本: {n_samples}, 样本对: {len(pw)}, 温度点: {n_temp}")
+print(f"BC 距离分布: [{y_raw.min():.3f}, {y_raw.max():.3f}], mean={y_raw.mean():.3f}, std={y_raw.std():.3f}")
+```
+
+## 划分与标准化
+
+样本对按 64%:16%:20% 划分为训练、验证、测试集。标准化器 `fit_scaler` 和 `fit_y_scaler` 仅在训练集上拟合，然后对所有子集统一应用——避免信息泄露。
+
+```{python}
+n = len(y_raw)
+i_train, i_test = train_test_split(np.arange(n), test_size=0.2, random_state=42)
+i_tr, i_val = train_test_split(i_train, test_size=0.2, random_state=42)
+
+x_mean, x_std = fit_scaler(X[i_tr])
+y_mean, y_std = fit_y_scaler(y_raw[i_tr])
+print(f"y: mean={y_mean:.4f} std={y_std:.4f}")
+print(f"x_std: mean={x_std.mean():.4f}, range=[{x_std.min():.4f},{x_std.max():.4f}]")
+
+ds_train = NormalizedPairDataset(X[i_tr], y_raw[i_tr], x_mean, x_std, y_mean, y_std)
+ds_val   = NormalizedPairDataset(X[i_val], y_raw[i_val], x_mean, x_std, y_mean, y_std)
+ds_test  = NormalizedPairDataset(X[i_test], y_raw[i_test], x_mean, x_std, y_mean, y_std)
+print(f"训练: {len(ds_train)}  验证: {len(ds_val)}  测试: {len(ds_test)}")
+```
+
+## 模型架构
+
+```{python}
+class SiameseRegressor(nn.Module):
+    """共享 MLP 编码器 + 回归头"""
+    def __init__(self, input_dim, hidden=128, emb_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(hidden, 64),        nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, emb_dim),
+        )
+        # 合并 [z1, z2, |z1 - z2|] 后回归标量距离
+        self.regressor = nn.Sequential(
+            nn.Linear(emb_dim * 3, 32), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x1, x2):
+        z1 = self.encoder(x1); z2 = self.encoder(x2)
+        return self.regressor(torch.cat([z1, z2, torch.abs(z1 - z2)], dim=1))
+```
+
+- 编码器：$n \xrightarrow{\text{128}} \xrightarrow{\text{64}} \xrightarrow{\text{32}}$，每层含 Dropout 0.3 正则化
+- 回归头：接受 $3 \times 32 = 96$ 维输入（两个嵌入 + 绝对值差），输出标量距离
+- 总参数量约 $n \times 128 + 128 \times 64 + 64 \times 32 + 96 \times 32 + 32 \times 1 \approx 25$k，极小
+
+## 训练
+
+AdamW 优化器（weight decay $10^{-3}$）+ CosineAnnealingWarmRestarts 调度器 + `clip_grad_norm_(1.0)` 梯度裁剪。MSE 损失函数，最大 200 epochs，early stopping patience=30。
+
+```{python}
+model = SiameseRegressor(n_temp, hidden=128, emb_dim=32)
+model, tr_loss, vl_loss, best = train_regression_model(
+    model, ds_train, ds_val, device=device,
+    epochs=200, lr=1e-3, batch_size=256, patience=30
+)
+print(f"Siamese 训练完成, 最佳 epoch: {best}")
+print(f"最佳验证 MSE: {min(vl_loss):.6f}")
+```
+
+## 评估
+
+在测试集（5,689 对，未参与训练和验证）上评估。预测值经过逆标准化还原到原始 BC 距离尺度。
+
+```{python}
+#| fig-width: 6
+#| fig-height: 6
+#| label: fig-siamese-scatter
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score, mean_squared_error
+
+pred_n = predict_all(model, ds_test, device)
+pred = pred_n * y_std + y_mean
+y_t = y_raw[i_test]
+
+rmse = np.sqrt(mean_squared_error(y_t, pred))
+r2   = r2_score(y_t, pred)
+spear = np.corrcoef(y_t, pred)[0,1]
+print(f"RMSE={rmse:.4f}  R²={r2:+.4f}  Spearman r={spear:+.4f}")
+
+fig, ax = plt.subplots(figsize=(6,5))
+ax.scatter(y_t, pred, alpha=0.3, s=8, color='steelblue')
+ax.plot([0,1],[0,1],'r--',lw=0.8)
+ax.set_xlabel('True Bray-Curtis Distance')
+ax.set_ylabel('Predicted Distance')
+ax.set_title(f'Siamese + MLP\nRMSE={rmse:.4f}  R²={r2:+.4f}')
+plt.tight_layout(); plt.show()
+```
+
+### 结果解读
+
+@fig-siamese-scatter 展示了模型在测试集上的表现：
+
+- **R² = +0.9838**：模型解释了 BC 距离中 98.4% 的方差，接近完美预测
+- **Spearman r = +0.9924**：预测与真实的排序几乎完美一致
+- **RMSE = 0.0419**：相比 BC 距离的标准差 0.33，误差约为标准差的 1/8
+
+作为对比：未经学习的**原始 HRM 欧氏距离与 BC 距离的 Spearman r 仅为 0.36**（见评估章节），Siamese 网络将相关性从 0.36 提升至 0.99，效果提升巨大。这表明 MLP 编码器从原始熔解曲线中提取到了与群落组成高度相关的非线性特征。
+
+需要注意的是 R² 极高（0.984）可能存在一定过拟合——测试集与训练集来自同一批玉米种子数据，真正泛化能力需要通过独立数据集交叉验证确认。
+
+## 导出
+
+对所有 28,441 个样本对预测，重建 $239 \times 239$ 距离矩阵，供评估章节进行 Mantel 检验。
+
+```{python}
+ds_all = NormalizedPairDataset(X, y_raw, x_mean, x_std, y_mean, y_std)
+pred_all = predict_all(model, ds_all, device) * y_std + y_mean
+
+pi = pm[["idx_A","idx_B"]].values - 1
+dm = build_pred_dist_matrix(pi.T, pred_all, n_samples)
+
+pm_out = pm.copy(); pm_out["siamese_pred"] = pred_all
+pm_out.to_csv("data-clean/hrm-dl-siamese-predictions.csv", index=False)
+pd.DataFrame(dm, index=sample_names, columns=sample_names).to_csv(
+    "data-clean/hrm-dl-siamese-dist.csv")
+print(f"Siamese 导出完成: {len(pred_all)} 对预测, {n_samples}x{n_samples} 距离矩阵")
+```

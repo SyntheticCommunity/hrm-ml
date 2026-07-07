@@ -104,6 +104,4 @@ p_rf_predict = lapply(seq_along(strain_label), function(i){
 })
 
 plot_grid(plotlist = p_rf_predict, ncol = 2, labels = "auto")
-
-ggsave(filename = "figures/figure-new-data-rf.jpg")
 ```

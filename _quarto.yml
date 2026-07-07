@@ -28,6 +28,13 @@ book:
     - experiment-corn-seed.qmd
     - new-data-single-species-modeling.qmd
     - new-data-modeling.qmd
+    - part: "Deep Learning: HRM → Microbial Community Distance"
+      chapters:
+        - hrm-deep-learning-data-prep.qmd
+        - hrm-deep-learning-siamese.qmd
+        - hrm-deep-learning-metric.qmd
+        - hrm-deep-learning-triplet.qmd
+        - hrm-deep-learning-evaluation.qmd
     - references.qmd
 
 bibliography: references.bib

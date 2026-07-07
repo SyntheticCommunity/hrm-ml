@@ -1,0 +1,210 @@
+---
+title: "HRM Deep Learning — Contrastive Learning (Triplet Loss)"
+author: "Chun-Hui Gao"
+date: "2026-07-06"
+jupyter: hrm-dl
+---
+
+## 方法原理
+
+与 Siamese 和 Metric Learning 不同，Triplet Loss 不要求模型预测精确的距离值，而是学习**样本间的相对相似性排序**。训练使用三元组 (Anchor, Positive, Negative)：
+
+$$\mathcal{L} = \max\left(0,\ \|f(A) - f(P)\|_2 - \|f(A) - f(N)\|_2 + \text{margin}\right)$$
+
+其中：
+
+- **Anchor (A)**：参考样本的 HRM 曲线
+- **Positive (P)**：与 A 群落最相似的样本（BC 距离最小）
+- **Negative (N)**：与 A 群落最不相似的样本（BC 距离最大）
+- **margin (0.3)**：要求 Positive 比 Negative 更接近 Anchor 的最小间隔
+
+### 为什么 Triplet 可能适用于此问题？
+
+BC 距离本身来自 ASV 测序，存在实验噪声。精确回归噪声较大的距离值未必最优——**学习"谁比谁更相似"的排序关系**可能更鲁棒。
+
+例如：两个样本的 BC 距离分别为 0.52 和 0.48，数值差 0.04 可能在测序噪声范围内，但"A 比 B 更相似于 C"这类排序关系更可信。
+
+### 局限性
+
+Triplet Loss **不约束嵌入距离的绝对值**，只保证 $d_{ap} < d_{an} - \text{margin}$。因此训练后的嵌入空间只适合排序和检索，不适合作为距离值直接使用。
+
+```{python}
+#| warning: false
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from sklearn.model_selection import train_test_split
+from scipy.spatial.distance import pdist, squareform
+
+from hrm_deep_learning_utils import (
+    fit_scaler, TripletDataset, train_triplet_model, encode_all,
+    build_pred_dist_matrix
+)
+
+torch.manual_seed(42); np.random.seed(42)
+device = torch.device('cpu')
+print(f"Device: {device}")
+```
+
+## 数据
+
+除样本对数据集外，Triplet 方法还需要完整 BC 距离矩阵来构建三元组。
+
+```{python}
+pw = pd.read_csv("data-clean/hrm-dl-pairs-wide.csv")
+pm = pd.read_csv("data-clean/hrm-dl-pairs-meta.csv")
+ss = pd.read_csv("data-clean/hrm-dl-samples.csv")
+bc_mat = pd.read_csv("data-clean/hrm-dl-bc-dist.csv", index_col=0).values
+
+sample_names = ss["sample_name"].values; n_samples = len(sample_names)
+temp_cols_all = [c for c in ss.columns if c.startswith("T")]
+hrm = ss[temp_cols_all].values.astype(np.float32)
+
+cols_a = [c for c in pw.columns if c.endswith("_A")]
+cols_b = [c for c in pw.columns if c.endswith("_B")]
+n_temp = len(cols_a)
+X = np.zeros((len(pw), 2, n_temp), dtype=np.float32)
+X[:,0,:] = pw[cols_a].values; X[:,1,:] = pw[cols_b].values
+y = pw["bc_distance"].values.astype(np.float32)
+
+x_mean, x_std = fit_scaler(X)
+print(f"样本: {n_samples}, 温度点: {n_temp}")
+```
+
+## 构建三元组
+
+对 239 个样本中的每个 anchor：
+
+1. 选择 BC 距离最小的非自身样本作为 Positive（最相似）
+2. 选择 BC 距离 > $d_{ap} + 0.2$ 的样本中随机一个作为 Negative（最不相似）
+3. 最多生成 5,000 个三元组，随机抽样控制训练量
+
+```{python}
+def build_triplets(dm, margin=0.2, max_t=None):
+    n_d = dm.shape[0]; rng = np.random.RandomState(42); tri = []
+    for a in range(n_d):
+        si = np.argsort(dm[a]); p = si[1]
+        nc = [j for j in range(n_d) if dm[a,j] > dm[a,p] + margin]
+        if not nc: nc = [j for j in range(n_d) if j != a and j != p]
+        if not nc: continue
+        tri.append((a, p, rng.choice(nc)))
+    tri = np.array(tri)
+    if max_t and len(tri) > max_t:
+        tri = tri[rng.choice(len(tri), max_t, replace=False)]
+    return tri
+
+triplets = build_triplets(bc_mat, margin=0.2, max_t=min(len(y), 5000))
+print(f"三元组总数: {len(triplets)}")
+print(f"正样本对平均 BC 距离: {bc_mat[triplets[:,0], triplets[:,1]].mean():.4f}")
+print(f"负样本对平均 BC 距离: {bc_mat[triplets[:,0], triplets[:,2]].mean():.4f}")
+
+i_t, i_te = train_test_split(np.arange(len(triplets)), test_size=0.2, random_state=42)
+i_tr, i_va = train_test_split(np.arange(len(i_t)), test_size=0.2, random_state=42)
+
+ds_train = TripletDataset(triplets[i_t][i_tr], hrm, x_mean, x_std)
+ds_val   = TripletDataset(triplets[i_t][i_va], hrm, x_mean, x_std)
+ds_test  = TripletDataset(triplets[i_te], hrm, x_mean, x_std)
+print(f"训练: {len(ds_train)}  验证: {len(ds_val)}  测试: {len(ds_test)}")
+```
+
+## 模型架构
+
+```{python}
+class TripletEncoder(nn.Module):
+    def __init__(self, encoder, margin=0.3):
+        super().__init__()
+        self.encoder = encoder; self.margin = margin
+
+    def forward(self, a, p, n):
+        za = self.encoder(a); zp = self.encoder(p); zn = self.encoder(n)
+        d_ap = torch.sqrt((za - zp).pow(2).sum(1) + 1e-8)
+        d_an = torch.sqrt((za - zn).pow(2).sum(1) + 1e-8)
+        # Hinge loss: 惩罚 d_ap >= d_an - margin 的情况
+        return torch.clamp(d_ap - d_an + self.margin, min=0).mean(), d_ap, d_an
+
+    def encode(self, x): return self.encoder(x)
+
+encoder = nn.Sequential(
+    nn.Linear(n_temp, 128), nn.ReLU(), nn.Dropout(0.3),
+    nn.Linear(128, 64),     nn.ReLU(), nn.Dropout(0.3),
+    nn.Linear(64, 32),
+)
+model = TripletEncoder(encoder, margin=0.3)
+
+model, tr_loss, vl_loss, best = train_triplet_model(
+    model, ds_train, ds_val, device=device,
+    epochs=150, lr=1e-3, batch_size=64, patience=30)
+print(f"Triplet: epoch={best} val_loss={min(vl_loss):.6f}")
+```
+
+- Margin=0.3：要求 Positive 距离比 Negative 距离至少近 0.3 个单位
+- 训练时三元组会重新 shuffle，确保每个 epoch 有不同的 batch 组合
+- 编码器架构与其他方法一致，便于比较
+
+## 评估
+
+Triplet Loss 不输出绝对距离值，评估重点在**排序一致性**。使用嵌入欧氏距离与 BC 距离的 Spearman 秩相关。
+
+```{python}
+#| fig-width: 6
+#| fig-height: 6
+#| label: fig-triplet-scatter
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score, mean_squared_error
+
+emb = encode_all(model.encoder, hrm, x_mean, x_std, device)
+
+# 全量 Spearman
+bc_vec = bc_mat[np.triu_indices_from(bc_mat, k=1)]
+emb_dm = squareform(pdist(emb, metric='euclidean'))
+emb_vec = emb_dm[np.triu_indices_from(emb_dm, k=1)]
+spear = np.corrcoef(bc_vec, emb_vec)[0,1]
+print(f"Triplet Spearman r (全量): {spear:.4f}")
+
+# 测试集评估
+pi = pm[["idx_A","idx_B"]].values - 1
+itp, _ = train_test_split(np.arange(len(y)), test_size=0.2, random_state=42)
+ev = np.array([np.sqrt(((emb[a]-emb[b])**2).sum()) for a,b in pi[itp]])
+yt = y[itp]
+print(f"RMSE={np.sqrt(mean_squared_error(yt,ev)):.4f}  R²={r2_score(yt,ev):.4f}")
+print(f"嵌入空间 norm 范围: [{np.linalg.norm(emb,axis=1).min():.2f}, {np.linalg.norm(emb,axis=1).max():.2f}]")
+
+fig, ax = plt.subplots(figsize=(6,5))
+ax.scatter(yt, ev, alpha=0.3, s=8, color='darkorange')
+ax.set_xlabel('True Bray-Curtis Distance')
+ax.set_ylabel('Embedding Euclidean Distance')
+ax.set_title(f'Triplet Contrastive Learning\nSpearman r={spear:.4f}')
+plt.tight_layout(); plt.show()
+```
+
+### 结果解读
+
+@fig-triplet-scatter 展示了 Triplet 嵌入距离与 BC 距离的关系：
+
+- **Spearman r = +0.566**：排序一致性强于随机（r=0），但弱于 Metric Learning（r=0.86）
+- **R² = −7.75**：绝对值几乎无预测能力——嵌入距离范围 [0.03, 4.94] 远大于 BC 距离范围 [0, 1]
+- **嵌入 norm**：0.47–3.54，部分样本的嵌入远偏离原点，导致 pairwise 距离失控
+
+### 为何 Triplet 表现最弱？
+
+1. **信息利用率低**：每个三元组只利用了"A-P 距离 < A-N 距离"这一个不等式，而 Siamese 和 Metric Learning 每个样本对都利用了精确的 BC 距离值
+2. **Hard Negative 不足**：margin=0.2 筛选的负样本往往已经是"明显更不相似"的简单样本，训练梯度主要来自边缘情况
+3. **尺度完全无约束**：没有任何机制将嵌入距离映射到 BC 距离的尺度上——嵌入向量只需满足排序关系
+4. **Triplet 选择随机性**：对每个 anchor 随机选一个 negative，可能遗漏 hardest negative
+
+如果希望 Triplet 方法在这个问题上表现更好，可能的改进方向包括：Hard negative mining（全局搜索最难区分的负样本）、结合 Semi-Hard Triplet 策略、或在 Triplet Loss 基础上附加正则项约束嵌入范数。
+
+## 导出
+
+```{python}
+ea = np.array([np.sqrt(((emb[a]-emb[b])**2).sum()) for a,b in pi])
+dm = build_pred_dist_matrix(pi.T, ea, n_samples)
+
+pd.DataFrame({"triplet_dist": ea}).to_csv(
+    "data-clean/hrm-dl-triplet-predictions.csv", index=False)
+pd.DataFrame(dm, index=sample_names, columns=sample_names).to_csv(
+    "data-clean/hrm-dl-triplet-dist.csv")
+pd.DataFrame(emb, index=sample_names,
+    columns=[f"emb_{i+1}" for i in range(emb.shape[1])]
+).to_csv("data-clean/hrm-dl-triplet-embeddings.csv")
+print("Triplet 导出完成")
+```
