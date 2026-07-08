@@ -22,7 +22,7 @@ Read the new QuantStudio data file and process melting curves.
 library(mcmodel)
 library(stringr)
 
-filename = "data-raw/modeling-qPCR/2026-3-19 222158.txt"
+filename = "data-raw/optimization-tm/2026-3-19 222158.txt"
 all = read_quantstudio(filename)
 
 sample = plate |>
