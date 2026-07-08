@@ -228,37 +228,40 @@ hrm_dist = dist(mc_shared, method = "euclidean")
 bc_sub = vegdist(as.matrix(asv_rel[common_samples, ]), method = "bray")
 ```
 
-**3. Mantel 检验与散点图。** Mantel 检验评估两个距离矩阵的 Spearman 秩相关：$H_0$ 为两个矩阵之间无相关关系。若显著正相关，说明 HRM 信号能反映群落组成差异。散点图将配对距离向量化，每个点对应一对样品的 Bray-Curtis 距离与 HRM 欧氏距离。
+**3. Mantel 检验与散点图。** Mantel 检验评估两个距离矩阵的 Spearman 秩相关：$H_0$ 为两个矩阵之间无相关关系。若显著正相关，说明 HRM 信号能反映群落组成差异。
 
 ```{r}
-#| fig-width: 10
-#| fig-height: 6
-#| label: fig-mantel-test
+#| warning: false
+#| message: false
 mantel_result = mantel(bc_sub, hrm_dist, method = "spearman",
                        permutations = 9999)
-cat("Mantel test: r =", round(mantel_result$statistic, 4),
-    ", p =", mantel_result$signif, "\n")
+cat("Mantel test (Spearman):\n")
+cat("  r =", round(mantel_result$statistic, 4), "\n")
+cat("  p =", mantel_result$signif, "\n")
+```
 
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| label: fig-mantel-scatter
 bc_vec = as.vector(bc_sub)
 hrm_vec = as.vector(hrm_dist)
-plot_df = data.frame(bray_curtis = bc_vec, euclidean = hrm_vec)
-lm_fit = lm(euclidean ~ bray_curtis, data = plot_df)
-r2 = summary(lm_fit)$r.squared
+r2 = round(cor(bc_vec, hrm_vec)^2, 3)
 
-ggplot(plot_df, aes(bray_curtis, euclidean)) +
-  geom_point(alpha = 0.3, size = 0.8, color = "steelblue") +
-  geom_smooth(method = "lm", se = TRUE, color = "red3", linewidth = 0.6) +
-  annotate("text", x = max(plot_df$bray_curtis) * 0.7,
-           y = max(plot_df$euclidean) * 0.95,
-           label = paste0("Spearman r = ", round(mantel_result$statistic, 3),
-                          "\np = ", mantel_result$signif,
-                          "\nR² = ", round(r2, 3)),
-           hjust = 0, size = 3.5) +
+plot_df = data.frame(bray_curtis = bc_vec, hrm_distance = hrm_vec)
+
+ggplot(plot_df, aes(bray_curtis, hrm_distance)) +
+  geom_point(alpha = 0.2, size = 0.7, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red3", linewidth = 0.5) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+           label = paste0("R² = ", r2), size = 4) +
   labs(x = "Bray-Curtis distance (16S ASV)",
-       y = "Euclidean distance (HRM curve)",
+       y = "HRM distance (Euclidean)",
        title = paste0("HRM vs. 16S Amplicon Distance (n = ",
                       length(common_samples), " samples)"))
 ```
+
+@fig-mantel-scatter 展示 HRM 欧氏距离与 16S Bray-Curtis 距离的关系。显著正相关表明 HRM 熔解曲线能反映微生物群落组成的差异。
 
 **4. 群落组成热图。** 选取平均相对丰度最高的 30 个 ASV，从分类表（`tax-table.txt`）中读取属和种信息，生成形如 `b1b7 Pantoea_ananatis` 的标签。
 
