@@ -1,0 +1,928 @@
+---
+title: "Siamese Network — Generalization Test"
+author: "Chun-Hui Gao"
+date: "2026-07-08"
+jupyter: hrm-dl
+---
+
+## 目标
+
+测试在玉米种子样品上训练的孪生网络+MLP模型在双菌种合成群落（application 验证实验）上的泛化能力。采用两种策略：
+
+1. **迁移学习**：使用预训练孪生网络编码器提取特征，训练新回归器预测菌株浓度
+2. **距离矩阵**：使用孪生网络计算样本间 HRM 距离，与 16S Bray-Curtis 距离进行 Mantel 检验
+
+## 背景
+
+- **训练模型**：`hrm-deep-learning-siamese.qmd` 在 239 个玉米种子样品（28,441 个样本对）上训练，预测 Bray-Curtis 距离，测试集 R² = 0.984，Spearman r = 0.992
+- **验证数据**：application 验证实验——40 个不同碳源培养的双菌种合成群落（*E. coli* 和 *P. putida*），每个样本含 16S rRNA 测序数据和 HRM 熔解曲线（80–90°C，3 个技术重复）
+- **关键差异**：训练数据为玉米种子微生物群落（高多样性，BC 距离 0.003–0.999），验证数据为双菌种人工群落（低多样性，BC 距离 0.002–0.274）
+
+```{python}
+#| warning: false
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from sklearn.ensemble import RandomForestRegressor
+from scipy.stats import spearmanr
+from scipy.spatial.distance import pdist, squareform
+import matplotlib.pyplot as plt
+
+torch.manual_seed(42); np.random.seed(42)
+device = torch.device('cpu')
+print(f"Device: {device}")
+```
+
+## 数据加载
+
+### 预训练模型
+
+```{python}
+class SiameseRegressor(nn.Module):
+    """与训练时完全相同的架构"""
+    def __init__(self, input_dim, hidden=128, emb_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(hidden, 64),        nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, emb_dim),
+        )
+        self.regressor = nn.Sequential(
+            nn.Linear(emb_dim * 3, 32), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x1, x2):
+        z1 = self.encoder(x1); z2 = self.encoder(x2)
+        return self.regressor(torch.cat([z1, z2, torch.abs(z1 - z2)], dim=1))
+
+    def encode(self, x):
+        """提取单个样本的特征嵌入"""
+        self.eval()
+        with torch.no_grad():
+            return self.encoder(x).numpy()
+
+# 加载模型权重和标准化参数
+checkpoint = torch.load("models/siamese_corn_seed.pt", map_location=device, weights_only=False)
+
+x_mean_corn = checkpoint['x_mean']
+x_std_corn = checkpoint['x_std']
+y_mean = checkpoint['y_mean']
+y_std = checkpoint['y_std']
+n_temp_corn = checkpoint['n_temp']
+hidden = checkpoint['hidden']
+emb_dim = checkpoint['emb_dim']
+
+print(f"✓ 已加载模型: models/siamese_corn_seed.pt")
+print(f"  - 输入维度: {n_temp_corn}")
+print(f"  - 隐藏层: {hidden}, 嵌入维度: {emb_dim}")
+print(f"  - BC 标准化: y_mean={y_mean:.4f}, y_std={y_std:.4f}")
+```
+
+```{python}
+# 创建模型并加载权重
+pretrained_model = SiameseRegressor(n_temp_corn, hidden=hidden, emb_dim=emb_dim)
+pretrained_model.load_state_dict(checkpoint['model_state_dict'])
+pretrained_model.eval()
+print(f"✓ 预训练模型加载完成")
+```
+
+### 双菌种合成群落数据
+
+训练集使用 20230512 的梯度矩阵（与 `method-evaluation.qmd` 一致），测试集使用 application 验证实验数据。
+
+```{python}
+# ---- 训练数据（梯度矩阵）----
+train_syncom = pd.read_csv("data-clean/20230512.csv")
+train_syncom = train_syncom[
+    (train_syncom['cycle'] == 30) &
+    (train_syncom['rep'] == 1)
+].copy()
+train_syncom = train_syncom.dropna(subset=['label_E', 'label_P'])
+
+temp_cols_train = [c for c in train_syncom.columns if c.startswith('T')]
+X_train = train_syncom[temp_cols_train].values.astype(np.float32)
+y_train = train_syncom[['label_E', 'label_P']].values.astype(np.float32)
+
+print(f"训练数据: {X_train.shape}, 标签: {y_train.shape}")
+print(f"温度范围: {temp_cols_train[0]} – {temp_cols_train[-1]} ({len(temp_cols_train)} 个温度点)")
+print(f"label_E: [{y_train[:,0].min():.6f}, {y_train[:,0].max():.1f}]")
+print(f"label_P: [{y_train[:,1].min():.6f}, {y_train[:,1].max():.1f}]")
+
+# ---- 测试数据（application 验证实验）----
+test_syncom = pd.read_csv("data-clean/hrm-siamese-generalization-hrm.csv")
+temp_cols_test = [c for c in test_syncom.columns if c.startswith('T')]
+X_test_raw = test_syncom[temp_cols_test].values.astype(np.float32)
+test_samples = test_syncom['sample'].values
+test_wells = test_syncom['well_position'].values
+test_carbon = np.array(list(test_syncom['carbon_source'].values))
+
+print(f"测试数据: {X_test_raw.shape}")
+print(f"温度范围: {temp_cols_test[0]} – {temp_cols_test[-1]} ({len(temp_cols_test)} 个温度点)")
+print(f"样本数: {test_syncom['sample'].nunique()}, 总行数（含技术重复）: {len(test_syncom)}")
+```
+
+### 温度维度对齐
+
+```{python}
+print(f"训练数据（玉米种子）温度点数: {n_temp_corn}")
+print(f"合成群落训练数据温度点数: {len(temp_cols_train)}")
+print(f"合成群落测试数据温度点数: {len(temp_cols_test)}")
+
+# 检查温度点数是否一致
+assert len(temp_cols_train) == len(temp_cols_test), \
+    f"训练({len(temp_cols_train)})和测试({len(temp_cols_test)})温度点数不一致"
+
+n_temp_syncom = len(temp_cols_train)
+
+# 与玉米种子数据的温度维度比较
+if n_temp_syncom == n_temp_corn:
+    print(f"✓ 合成群落与玉米种子温度点数一致 ({n_temp_syncom})")
+else:
+    print(f"⚠ 温度点数不一致: 玉米种子 {n_temp_corn} vs 合成群落 {n_temp_syncom}")
+    print(f"  需要插值对齐（取交集或训练数据插值到合成群落的温度点）")
+```
+
+## 方案一：迁移学习
+
+### 1.1 标准化与特征提取
+
+```{python}
+# 标准化合成群落数据（使用自身统计量）
+x_mean_syncom = X_train.mean(axis=0)
+x_std_syncom = X_train.std(axis=0)
+x_std_syncom[x_std_syncom < 1e-6] = 1.0
+
+# 两种标准化方案
+# 方案A：使用合成群落自身的标准化参数
+X_train_norm = (X_train - x_mean_syncom) / x_std_syncom
+X_test_norm = (X_test_raw - x_mean_syncom) / x_std_syncom
+
+print(f"标准化完成（使用合成群落统计量）")
+print(f"  x_mean_syncom: mean={x_mean_syncom.mean():.4f}, std={x_mean_syncom.std():.4f}")
+print(f"  x_std_syncom: mean={x_std_syncom.mean():.4f}, std={x_std_syncom.std():.4f}")
+```
+
+### 1.2 使用预训练编码器提取特征
+
+由于玉米种子和合成群落的温度点数可能不同，这里使用合成群落数据自身的标准化参数，让编码器在特征空间中对齐。如果是相同的输入维度，则直接使用。
+
+::: {.callout-important}
+**温度点数差异问题**：玉米种子训练数据使用 99 个温度点，而 application HRM 数据经过重新处理后有 100 个温度点。当维度不匹配时编码器无法直接使用。这种差异可能源于数据预处理时对温度边界（80°C vs 80.1°C 起始）的处理不同。
+:::
+
+```{python}
+# 直接使用原始 HRM 特征作为基线（不需要维度匹配）
+# 对于迁移学习，需要处理维度差异
+
+# 方案1: 取交集温度点
+corn_temp_cols = [f"T{80 + i*0.1:.1f}" for i in range(n_temp_corn)]
+# 找出共同温度点
+common_temps = [t for t in temp_cols_train if t in set(corn_temp_cols)]
+print(f"共同温度点数: {len(common_temps)}")
+
+# 直接使用原始特征空间的随机森林作为基线对比
+# 这是更公平的比较——两个方法使用完全相同的输入
+```
+
+### 1.3 基线方法：原始 HRM 特征 + 随机森林
+
+与 `method-evaluation.qmd` 一致，直接使用 HRM 曲线温度点作为特征：
+
+```{python}
+# 标签转换：对数空间中的回归（避免浓度跨越多个数量级的问题）
+# label_E 和 label_P 范围 [0, 1]，使用 log2(1+x) 避免 log(0)
+y_train_log = np.log2(1 + y_train)
+
+rf_E_baseline = RandomForestRegressor(n_estimators=1000, random_state=42, n_jobs=-1)
+rf_P_baseline = RandomForestRegressor(n_estimators=1000, random_state=42, n_jobs=-1)
+
+rf_E_baseline.fit(X_train, y_train_log[:, 0])
+rf_P_baseline.fit(X_train, y_train_log[:, 1])
+
+# 预测并逆变换
+pred_E_baseline = 2 ** rf_E_baseline.predict(X_test_raw) - 1
+pred_P_baseline = 2 ** rf_P_baseline.predict(X_test_raw) - 1
+
+print(f"基线方法完成")
+print(f"  E. coli 预测范围: [{pred_E_baseline.min():.4f}, {pred_E_baseline.max():.4f}]")
+print(f"  P. putida 预测范围: [{pred_P_baseline.min():.4f}, {pred_P_baseline.max():.4f}]")
+```
+
+### 1.4 迁移学习方法：直接预测 BC 距离而非浓度
+
+由于训练任务是 BC 距离预测（非浓度预测），迁移学习更适合用于**距离矩阵分析**（方案二），而非直接预测菌株浓度。
+
+浓度预测的挑战：
+- 编码器训练目标是距离回归，学到的嵌入空间对**样本间的相对距离**编码较好
+- 但对**单个样本的绝对浓度**编码没有显式监督
+- 在特征空间上训练的随机森林需要足够覆盖目标浓度范围的训练样本
+
+```{python}
+# 迁移学习探索：使用编码器特征训练回归器
+# 注意：由于维度差异，此处展示流程框架
+# 实际执行需要先解决温度点对齐问题
+
+if n_temp_syncom == n_temp_corn:
+    # 维度匹配时的直接迁移
+    pretrained_model.eval()
+    with torch.no_grad():
+        train_features = pretrained_model.encoder(
+            torch.FloatTensor(X_train_norm)
+        ).numpy()
+        test_features = pretrained_model.encoder(
+            torch.FloatTensor(X_test_norm)
+        ).numpy()
+    print(f"提取特征维度: train={train_features.shape}, test={test_features.shape}")
+
+    # 在嵌入空间训练随机森林
+    rf_E_transfer = RandomForestRegressor(n_estimators=500, max_depth=10, random_state=42, n_jobs=-1)
+    rf_P_transfer = RandomForestRegressor(n_estimators=500, max_depth=10, random_state=42, n_jobs=-1)
+
+    rf_E_transfer.fit(train_features, y_train_log[:, 0])
+    rf_P_transfer.fit(train_features, y_train_log[:, 1])
+
+    pred_E_transfer = 2 ** rf_E_transfer.predict(test_features) - 1
+    pred_P_transfer = 2 ** rf_P_transfer.predict(test_features) - 1
+
+    print(f"迁移学习完成")
+    print(f"  E. coli 预测范围: [{pred_E_transfer.min():.4f}, {pred_E_transfer.max():.4f}]")
+    print(f"  P. putida 预测范围: [{pred_P_transfer.min():.4f}, {pred_P_transfer.max():.4f}]")
+else:
+    print(f"⚠ 维度不匹配 ({n_temp_syncom} vs {n_temp_corn})，跳过编码器特征提取")
+    print("  直接使用原始 HRM 特征进行下游分析")
+    # 将基线结果作为统一输出
+    pred_E_transfer = pred_E_baseline.copy()
+    pred_P_transfer = pred_P_baseline.copy()
+```
+
+### 1.5 预测结果汇总
+
+```{python}
+# 按样本（碳源）汇总预测（对技术重复取均值）
+results_list = []
+for sample_id in sorted(test_syncom['sample'].unique()):
+    mask = test_samples == sample_id
+    carbon = test_carbon[mask][0]
+    results_list.append({
+        'sample': sample_id,
+        'carbon_source': carbon,
+        'n_reps': mask.sum(),
+        'pred_E_baseline_mean': pred_E_baseline[mask].mean(),
+        'pred_P_baseline_mean': pred_P_baseline[mask].mean(),
+        'pred_E_baseline_std': pred_E_baseline[mask].std(),
+        'pred_P_baseline_std': pred_P_baseline[mask].std(),
+    })
+
+results_df = pd.DataFrame(results_list)
+
+# 计算相对丰度
+eps = 1e-10
+results_df['prop_E_baseline'] = results_df['pred_E_baseline_mean'] / (
+    results_df['pred_E_baseline_mean'] + results_df['pred_P_baseline_mean'] + eps
+)
+
+print(f"预测结果汇总: {len(results_df)} 个样本（碳源）")
+print(results_df[['sample', 'carbon_source', 'prop_E_baseline']].head(10).to_string(index=False))
+
+# 保存结果
+results_df.to_csv("data-clean/hrm-siamese-generalization-predictions.csv", index=False)
+print("\n✓ 预测结果已保存到 data-clean/hrm-siamese-generalization-predictions.csv")
+```
+
+```{python}
+#| fig-width: 10
+#| fig-height: 5
+#| label: fig-prediction-distribution
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+
+# E. coli 预测比例分布
+ax = axes[0]
+ax.bar(range(len(results_df)), results_df['prop_E_baseline'],
+       color='#CD3333', alpha=0.7, edgecolor='white', linewidth=0.5)
+ax.axhline(y=0.5, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+ax.set_xlabel('Sample Index')
+ax.set_ylabel('Predicted E. coli Proportion')
+ax.set_title(f'E. coli Predicted Proportion\nMean = {results_df["prop_E_baseline"].mean():.3f}, '
+             f'SD = {results_df["prop_E_baseline"].std():.3f}')
+ax.set_ylim(0, 1)
+
+# P. putida vs E. coli 预测值
+ax = axes[1]
+ax.scatter(results_df['pred_E_baseline_mean'], results_df['pred_P_baseline_mean'],
+           alpha=0.6, s=40, color='steelblue')
+ax.set_xlabel('Predicted E. coli')
+ax.set_ylabel('Predicted P. putida')
+ax.set_title('Predicted Concentrations (Log Scale)')
+
+# 对角线参考线
+lims = [min(results_df['pred_E_baseline_mean'].min(), results_df['pred_P_baseline_mean'].min()),
+        max(results_df['pred_E_baseline_mean'].max(), results_df['pred_P_baseline_mean'].max())]
+ax.plot(lims, lims, 'r--', lw=0.8, alpha=0.5)
+ax.set_xscale('log'); ax.set_yscale('log')
+
+plt.tight_layout()
+plt.show()
+```
+
+## 方案二：距离矩阵分析
+
+使用孪生网络计算合成群落样本间的 HRM 距离矩阵，与 16S 测序的 Bray-Curtis 距离进行 Mantel 检验，评估深度学习距离度量是否优于原始欧氏距离。
+
+### 2.1 加载 16S Bray-Curtis 距离矩阵
+
+BC 距离矩阵由 `hrm-siamese-generalization-ngs.qmd` 生成（DADA2 流程，3 个 ASV）：
+
+```{python}
+# BC 距离矩阵（40 个样本）
+bc_dist_df = pd.read_csv("data-clean/hrm-siamese-generalization-bc-aligned.csv", index_col=0)
+bc_samples = list(bc_dist_df.index)
+bc_matrix = bc_dist_df.values
+
+n_bc = len(bc_samples)
+bc_upper = bc_matrix[np.triu_indices_from(bc_matrix, k=1)]
+print(f"BC 距离矩阵: {n_bc}×{n_bc}")
+print(f"BC 距离范围: [{bc_upper.min():.4f}, {bc_upper.max():.4f}]")
+print(f"BC 距离均值: {bc_upper.mean():.4f} ± {bc_upper.std():.4f}")
+```
+
+### 2.2 计算 HRM 距离矩阵
+
+对 application 数据的 120 条 HRM 曲线（40 样本 × 3 技术重复），计算所有配对距离。
+
+#### 2.2.1 原始欧氏距离
+
+```{python}
+# 对所有行（含技术重复）计算欧氏距离
+euclidean_dist = pdist(X_test_raw, metric='euclidean')
+euclidean_matrix = squareform(euclidean_dist)
+
+print(f"欧氏距离矩阵: {euclidean_matrix.shape}")
+print(f"欧氏距离范围: [{euclidean_dist.min():.4f}, {euclidean_dist.max():.4f}]")
+
+# 保存完整矩阵（含技术重复）
+pd.DataFrame(euclidean_matrix,
+             index=test_samples,
+             columns=test_samples).to_csv(
+    "data-clean/hrm-siamese-generalization-euclidean.csv"
+)
+print("✓ 欧氏距离矩阵已保存")
+```
+
+#### 2.2.2 孪生网络距离
+
+使用预训练的孪生网络预测所有样本对的 BC 距离：
+
+```{python}
+def compute_siamese_distance(model, X, x_mean, x_std, y_mean, y_std, device='cpu'):
+    """计算所有样本对的孪生网络距离"""
+    # 标准化
+    X_norm = (X - x_mean) / x_std
+    X_tensor = torch.FloatTensor(X_norm)
+
+    n = len(X)
+    n_pairs = n * (n - 1) // 2
+    distances = np.zeros(n_pairs, dtype=np.float32)
+
+    model.eval()
+    model.to(device)
+    X_tensor = X_tensor.to(device)
+
+    idx = 0
+    batch_size = 256
+    with torch.no_grad():
+        for i in range(n):
+            for j in range(i + 1, n):
+                x1 = X_tensor[i:i+1]
+                x2 = X_tensor[j:j+1]
+                pred = model(x1, x2).cpu().item()
+                # 逆变换到原始 BC 尺度
+                distances[idx] = pred * y_std + y_mean
+                idx += 1
+
+    # 构建距离矩阵
+    dist_matrix = np.zeros((n, n))
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist_matrix[i, j] = distances[idx]
+            dist_matrix[j, i] = distances[idx]
+            idx += 1
+
+    return dist_matrix, distances
+
+if n_temp_syncom == n_temp_corn:
+    # 维度匹配：使用玉米种子标准化参数
+    siamese_matrix, siamese_distances = compute_siamese_distance(
+        pretrained_model, X_test_raw,
+        x_mean_corn, x_std_corn,
+        y_mean, y_std, device
+    )
+    print(f"孪生网络距离矩阵: {siamese_matrix.shape}")
+    print(f"孪生网络距离范围: [{siamese_distances.min():.4f}, {siamese_distances.max():.4f}]")
+    print(f"孪生网络距离均值: {siamese_distances.mean():.4f} ± {siamese_distances.std():.4f}")
+
+    # 保存
+    pd.DataFrame(siamese_matrix,
+                 index=[str(s) for s in test_samples],
+                 columns=[str(s) for s in test_samples]).to_csv(
+        "data-clean/hrm-siamese-generalization-dist.csv"
+    )
+    print("✓ 孪生网络距离矩阵已保存")
+else:
+    print(f"⚠ 维度不匹配，跳过孪生网络距离计算")
+    # 从已保存文件加载（如果之前运行过）
+    try:
+        siamese_df = pd.read_csv("data-clean/hrm-siamese-generalization-dist.csv", index_col=0)
+        siamese_matrix = siamese_df.values
+        siamese_distances = siamese_matrix[np.triu_indices_from(siamese_matrix, k=1)]
+        print(f"从文件加载孪生网络距离: {siamese_matrix.shape}")
+    except FileNotFoundError:
+        siamese_matrix = None
+        siamese_distances = None
+        print("  且无已保存文件")
+```
+
+### 2.3 距离矩阵可视化
+
+```{python}
+#| fig-width: 14
+#| fig-height: 4.5
+#| label: fig-distance-heatmap
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+# BC 距离（金标准）
+im0 = axes[0].imshow(bc_matrix, cmap='viridis', aspect='auto',
+                      vmin=0, vmax=max(bc_upper.max(), 0.3))
+axes[0].set_title(f'16S Bray-Curtis Distance\nRange: [{bc_upper.min():.3f}, {bc_upper.max():.3f}]')
+axes[0].set_xlabel('Sample'); axes[0].set_ylabel('Sample')
+plt.colorbar(im0, ax=axes[0], fraction=0.046)
+
+# 欧氏距离
+eu_upper = euclidean_dist  # already flat from pdist
+im1 = axes[1].imshow(euclidean_matrix, cmap='viridis', aspect='auto')
+axes[1].set_title(f'HRM Euclidean Distance\nRange: [{eu_upper.min():.3f}, {eu_upper.max():.3f}]')
+axes[1].set_xlabel('Sample'); axes[1].set_ylabel('Sample')
+plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+# 孪生网络距离
+if siamese_matrix is not None:
+    si_upper = siamese_distances
+    im2 = axes[2].imshow(siamese_matrix, cmap='viridis', aspect='auto')
+    axes[2].set_title(f'Siamese Network Distance\nRange: [{si_upper.min():.3f}, {si_upper.max():.3f}]')
+    axes[2].set_xlabel('Sample'); axes[2].set_ylabel('Sample')
+    plt.colorbar(im2, ax=axes[2], fraction=0.046)
+else:
+    axes[2].text(0.5, 0.5, 'N/A (dimension mismatch)',
+                 ha='center', va='center', transform=axes[2].transAxes)
+    axes[2].set_title('Siamese Network Distance')
+
+plt.tight_layout()
+plt.show()
+```
+
+### 2.4 汇总为样本级别距离矩阵
+
+将含技术重复的 HRM 距离矩阵汇总为样本级别的平均距离矩阵，并与 16S BC 距离矩阵对齐：
+
+```{python}
+def collapse_tech_reps(df):
+    """将技术重复的距离矩阵汇总为样本级别平均值"""
+    def clean(x):
+        # 去除技术重复后缀：'A2.1' → 'A2', 'A2' → 'A2'
+        s = str(x)
+        parts = s.rsplit('.', 1)
+        if len(parts) == 2 and parts[1].replace('.', '').isdigit():
+            return parts[0]
+        return s
+    df = df.copy()
+    df.index = [clean(x) for x in df.index]
+    df.columns = [clean(x) for x in df.columns]
+    return df.groupby(df.index).mean().T.groupby(df.columns).mean().T
+
+def upper_tri(matrix):
+    """提取距离矩阵的上三角（排除对角线）"""
+    return matrix[np.triu_indices_from(matrix, k=1)]
+
+# BC 距离矩阵 — 已是样本级别（40×40）
+bc_sample = bc_matrix
+
+# 欧氏距离 — 120×120 含技术重复 → 汇总为 40×40
+eu_df = pd.DataFrame(euclidean_matrix,
+                      index=[str(s) for s in test_samples],
+                      columns=[str(s) for s in test_samples])
+eu_sample = collapse_tech_reps(eu_df)
+
+print(f"BC（样本级）:  {bc_sample.shape}")
+print(f"欧氏（样本级）: {eu_sample.shape}")
+
+# 孪生网络距离
+if siamese_matrix is not None:
+    si_df = pd.DataFrame(siamese_matrix,
+                          index=[str(s) for s in test_samples],
+                          columns=[str(s) for s in test_samples])
+    si_sample = collapse_tech_reps(si_df)
+    print(f"孪生网络（样本级）: {si_sample.shape}")
+else:
+    si_sample = None
+
+# ---- 对齐样本名称 ----
+bc_names = list(bc_dist_df.index)       # BC 矩阵的行名
+eu_names = list(eu_sample.index)        # 欧氏矩阵的行名
+common = sorted(set(bc_names) & set(eu_names))
+print(f"\n共同样本数: {len(common)}")
+
+# 提取共同样本并对齐
+bc_aligned = bc_dist_df.loc[common, common].values
+eu_aligned = eu_sample.loc[common, common].values
+print(f"对齐后 BC:  {bc_aligned.shape}")
+print(f"对齐后 欧氏: {eu_aligned.shape}")
+
+if si_sample is not None:
+    si_names = list(si_sample.index)
+    common_si = sorted(set(common) & set(si_names))
+    si_aligned = si_sample.loc[common_si, common_si].values
+    bc_si_aligned = bc_dist_df.loc[common_si, common_si].values
+    eu_si_aligned = eu_sample.loc[common_si, common_si].values
+    print(f"含孪生网络的共同样本: {len(common_si)}")
+```
+
+### 2.5 距离矩阵可视化
+
+```{python}
+#| fig-width: 14
+#| fig-height: 4.5
+#| label: fig-distance-heatmap-2
+
+# 使用对齐后的样本级矩阵
+fig, axes = plt.subplots(1, 3 if si_sample is not None else 2,
+                          figsize=(5 * (3 if si_sample is not None else 2), 4.5))
+axes = np.atleast_1d(axes)
+
+# BC 距离（金标准）
+bc_upper = upper_tri(bc_aligned)
+im0 = axes[0].imshow(bc_aligned, cmap='viridis', aspect='auto',
+                      vmin=0, vmax=max(bc_upper.max(), 0.3))
+axes[0].set_title(f'16S Bray-Curtis\nRange: [{bc_upper.min():.3f}, {bc_upper.max():.3f}]')
+axes[0].set_xlabel('Sample'); axes[0].set_ylabel('Sample')
+plt.colorbar(im0, ax=axes[0], fraction=0.046, label='BC Distance')
+
+# 欧氏距离
+eu_upper = upper_tri(eu_aligned)
+im1 = axes[1].imshow(eu_aligned, cmap='viridis', aspect='auto')
+axes[1].set_title(f'HRM Euclidean\nRange: [{eu_upper.min():.3f}, {eu_upper.max():.3f}]')
+axes[1].set_xlabel('Sample'); axes[1].set_ylabel('Sample')
+plt.colorbar(im1, ax=axes[1], fraction=0.046, label='Euclidean Distance')
+
+# 孪生网络距离
+if si_sample is not None:
+    si_upper = upper_tri(si_aligned)
+    im2 = axes[2].imshow(si_aligned, cmap='viridis', aspect='auto')
+    axes[2].set_title(f'Siamese Network\nRange: [{si_upper.min():.3f}, {si_upper.max():.3f}]')
+    axes[2].set_xlabel('Sample'); axes[2].set_ylabel('Sample')
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, label='Siamese Distance')
+
+plt.tight_layout()
+plt.show()
+```
+
+### 2.6 距离相关性散点图
+
+```{python}
+#| fig-width: 14
+#| fig-height: 4.5
+#| label: fig-distance-correlation
+
+bc_u = upper_tri(bc_aligned)
+eu_u = upper_tri(eu_aligned)
+
+fig, axes = plt.subplots(1, 3 if si_sample is not None else 2,
+                          figsize=(5 * (3 if si_sample is not None else 2), 4.5))
+axes = np.atleast_1d(axes)
+
+ax_idx = 0
+
+# 孪生网络 vs BC
+if si_sample is not None:
+    si_u = upper_tri(si_aligned)
+    bc_si_u = upper_tri(bc_si_aligned)
+    r_si, p_si_pearson = spearmanr(bc_si_u, si_u)
+    ax = axes[ax_idx]; ax_idx += 1
+    ax.scatter(bc_si_u, si_u, alpha=0.4, s=15, color='#2E86AB')
+    ax.set_xlabel('16S Bray-Curtis Distance')
+    ax.set_ylabel('Siamese Network Distance')
+    ax.set_title(f'Siamese vs BC\nSpearman r = {r_si:.4f}')
+    z = np.polyfit(bc_si_u, si_u, 1)
+    x_line = np.linspace(bc_si_u.min(), bc_si_u.max(), 100)
+    ax.plot(x_line, np.polyval(z, x_line), 'r--', lw=1, alpha=0.6)
+
+# 欧氏 vs BC
+r_eu, p_eu_pearson = spearmanr(bc_u, eu_u)
+ax = axes[ax_idx]; ax_idx += 1
+ax.scatter(bc_u, eu_u, alpha=0.4, s=15, color='#A23B72')
+ax.set_xlabel('16S Bray-Curtis Distance')
+ax.set_ylabel('Euclidean Distance')
+ax.set_title(f'Euclidean vs BC\nSpearman r = {r_eu:.4f}')
+z = np.polyfit(bc_u, eu_u, 1)
+x_line = np.linspace(bc_u.min(), bc_u.max(), 100)
+ax.plot(x_line, np.polyval(z, x_line), 'r--', lw=1, alpha=0.6)
+
+# 孪生网络 vs 欧氏
+if si_sample is not None:
+    eu_si_u = upper_tri(eu_si_aligned)
+    si_u2 = upper_tri(si_aligned)
+    r_se, p_se_pearson = spearmanr(eu_si_u, si_u2)
+    ax = axes[ax_idx]
+    ax.scatter(eu_si_u, si_u2, alpha=0.4, s=15, color='#F18F01')
+    ax.set_xlabel('Euclidean Distance')
+    ax.set_ylabel('Siamese Network Distance')
+    ax.set_title(f'Siamese vs Euclidean\nSpearman r = {r_se:.4f}')
+    z = np.polyfit(eu_si_u, si_u2, 1)
+    x_line = np.linspace(eu_si_u.min(), eu_si_u.max(), 100)
+    ax.plot(x_line, np.polyval(z, x_line), 'r--', lw=1, alpha=0.6)
+
+plt.tight_layout()
+plt.show()
+
+# 汇总表
+print("=" * 55)
+print("距离矩阵 Spearman 相关性汇总（样本级，对齐后）")
+print("=" * 55)
+print(f"{'比较':<32} {'r':>8} {'显著性':>8}")
+print("-" * 55)
+def sig(p):
+    return '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+if si_sample is not None:
+    print(f"{'Siamese vs BC':<32} {r_si:>8.4f} {sig(p_si_pearson):>8}")
+print(f"{'Euclidean vs BC':<32} {r_eu:>8.4f} {sig(p_eu_pearson):>8}")
+if si_sample is not None:
+    print(f"{'Siamese vs Euclidean':<32} {r_se:>8.4f} {sig(p_se_pearson):>8}")
+```
+
+## Mantel 检验
+
+Mantel 检验通过随机置换距离矩阵的行/列标签（9999 次），构建原假设（两个距离矩阵无关联）下的 Spearman r 零分布，评估观测相关性的统计显著性。
+
+```{python}
+def mantel_test(dist_x, dist_y, n_perms=9999, method='spearman', seed=42):
+    """
+    Mantel 置换检验。
+
+    Parameters
+    ----------
+    dist_x, dist_y : ndarray
+        样本级对称距离矩阵（n×n）。
+    n_perms : int
+        置换次数。
+    method : str
+        相关性方法，'spearman' 或 'pearson'。
+    seed : int
+        随机种子。
+
+    Returns
+    -------
+    dict with keys: r_obs, p_value, null_dist, quantiles
+    """
+    rng = np.random.RandomState(seed)
+    n = dist_x.shape[0]
+    tri_idx = np.triu_indices(n, k=1)
+
+    # 观测相关性
+    x_vec = dist_x[tri_idx]
+    y_vec = dist_y[tri_idx]
+
+    if method == 'spearman':
+        from scipy.stats import rankdata
+        x_vec = rankdata(x_vec)
+        y_vec = rankdata(y_vec)
+        r_obs = np.corrcoef(x_vec, y_vec)[0, 1]
+    else:
+        r_obs = np.corrcoef(x_vec, y_vec)[0, 1]
+
+    # 置换检验：固定 X，打乱 Y 的行/列顺序
+    null_vals = np.empty(n_perms)
+    labels = np.arange(n)
+    for i in range(n_perms):
+        perm = rng.permutation(labels)
+        y_perm = dist_y[perm][:, perm]
+        yp_vec = y_perm[tri_idx]
+        if method == 'spearman':
+            yp_vec = rankdata(yp_vec)
+            null_vals[i] = np.corrcoef(x_vec, yp_vec)[0, 1]
+        else:
+            null_vals[i] = np.corrcoef(x_vec, yp_vec)[0, 1]
+
+    # 双尾 p 值：|null| >= |r_obs| 的比例
+    p_value = (np.abs(null_vals) >= np.abs(r_obs)).mean()
+
+    # 分位数
+    quantiles = {
+        '90%': np.percentile(null_vals, 90),
+        '95%': np.percentile(null_vals, 95),
+        '97.5%': np.percentile(null_vals, 97.5),
+        '99%': np.percentile(null_vals, 99),
+    }
+
+    return {
+        'r_obs': r_obs,
+        'p_value': p_value,
+        'null_dist': null_vals,
+        'quantiles': quantiles,
+        'n_perms': n_perms,
+        'method': method,
+    }
+
+
+def print_mantel_result(name, result):
+    """格式化打印 Mantel 检验结果"""
+    print(f"\n=== {name} ===")
+    print(f"Mantel statistic r (Spearman): {result['r_obs']:.4f}")
+    print(f"Significance (p-value):        {result['p_value']:.4f}")
+    print(f"Upper quantiles of permutations (null model):")
+    for k, v in result['quantiles'].items():
+        print(f"  {k:>6s}  {v:.4f}")
+    print(f"Permutation: free, Number of permutations: {result['n_perms']}")
+    sig_str = '***' if result['p_value'] < 0.001 else '**' if result['p_value'] < 0.01 else '*' if result['p_value'] < 0.05 else 'ns'
+    print(f"→ {'显著' if result['p_value'] < 0.05 else '不显著'} ({sig_str})")
+```
+
+### 执行 Mantel 检验
+
+```{python}
+# 使用对齐后的样本级距离矩阵
+# 欧氏 vs BC（所有共同样本）
+print("=" * 55)
+print("Mantel 检验：HRM 距离 vs 16S Bray-Curtis 距离")
+print(f"样本数: {len(common)}, 置换次数: 9999")
+print("=" * 55)
+
+# 1. 欧氏距离 vs BC
+result_eu = mantel_test(eu_aligned, bc_aligned, n_perms=9999, seed=42)
+print_mantel_result("Euclidean HRM vs 16S BC", result_eu)
+
+# 2. 孪生网络距离 vs BC
+if si_sample is not None:
+    result_si = mantel_test(si_aligned, bc_si_aligned, n_perms=9999, seed=42)
+    print_mantel_result("Siamese Network HRM vs 16S BC", result_si)
+
+# 汇总
+print("\n" + "=" * 55)
+print("Mantel 检验结果汇总")
+print("=" * 55)
+print(f"{'方法':<30} {'Spearman r':>10} {'p-value':>10} {'显著性':>8}")
+print("-" * 55)
+if si_sample is not None:
+    print(f"{'Siamese vs BC':<30} {result_si['r_obs']:>10.4f} {result_si['p_value']:>10.4f} {'***' if result_si['p_value'] < 0.001 else '**' if result_si['p_value'] < 0.01 else '*' if result_si['p_value'] < 0.05 else 'ns':>8}")
+print(f"{'Euclidean vs BC':<30} {result_eu['r_obs']:>10.4f} {result_eu['p_value']:>10.4f} {'***' if result_eu['p_value'] < 0.001 else '**' if result_eu['p_value'] < 0.01 else '*' if result_eu['p_value'] < 0.05 else 'ns':>8}")
+
+# 比较两种方法
+if si_sample is not None:
+    print()
+    if result_si['r_obs'] > result_eu['r_obs']:
+        improvement = result_si['r_obs'] - result_eu['r_obs']
+        print(f"✓ Siamese Network 提升了 {improvement:.4f} ({100 * improvement / result_eu['r_obs']:.1f}%)")
+    else:
+        degradation = result_eu['r_obs'] - result_si['r_obs']
+        print(f"✗ Siamese Network 降低了 {degradation:.4f} ({100 * degradation / result_eu['r_obs']:.1f}%)")
+        print(f"  欧氏距离在本数据集上表现更优")
+```
+
+### 置换零分布可视化
+
+```{python}
+#| fig-width: 12
+#| fig-height: 4.5
+#| label: fig-mantel-null
+
+fig, axes = plt.subplots(1, 2 if si_sample is not None else 1,
+                          figsize=(6 * (2 if si_sample is not None else 1), 4.5))
+axes = np.atleast_1d(axes)
+
+def plot_null_dist(ax, null_dist, r_obs, p_val, title):
+    """绘制置换零分布与观测值"""
+    ax.hist(null_dist, bins=50, color='lightgray', edgecolor='gray', density=True, alpha=0.7)
+    ax.axvline(x=r_obs, color='#CD3333', lw=2, linestyle='--',
+               label=f'Observed r = {r_obs:.4f}')
+    ax.axvline(x=0, color='black', lw=0.8, linestyle='-', alpha=0.3)
+    ax.set_xlabel("Spearman r")
+    ax.set_ylabel("Density")
+    ax.set_title(title)
+    ax.legend()
+
+# 欧氏距离
+plot_null_dist(axes[0], result_eu['null_dist'], result_eu['r_obs'], result_eu['p_value'],
+               f"Euclidean vs BC\np = {result_eu['p_value']:.4f} "
+               f"({'***' if result_eu['p_value'] < 0.001 else '**' if result_eu['p_value'] < 0.01 else '*' if result_eu['p_value'] < 0.05 else 'ns'})")
+
+# 孪生网络
+if si_sample is not None:
+    plot_null_dist(axes[1], result_si['null_dist'], result_si['r_obs'], result_si['p_value'],
+                   f"Siamese Network vs BC\np = {result_si['p_value']:.4f} "
+                   f"({'***' if result_si['p_value'] < 0.001 else '**' if result_si['p_value'] < 0.01 else '*' if result_si['p_value'] < 0.05 else 'ns'})")
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-important}
+## 核心发现
+
+1. **孪生网络距离与 16S BC 距离无显著相关性**——模型在玉米种子数据上训练的距离度量**无法直接迁移**到双菌种合成群落
+2. **原始欧氏距离与 16S BC 距离有显著相关性**——虽然为弱相关，但统计学上显著，说明 HRM 曲线的原始形状差异已经包含了部分群落组成信息
+3. 孪生网络预测的距离范围（~0.5–0.9）与 BC 距离范围（~0.0–0.3）严重不匹配，说明模型对低多样性群落的距离估计存在系统性偏差
+:::
+
+## 结果解读
+
+### 为什么孪生网络泛化失败？
+
+1. **数据分布差异巨大**
+   - **训练数据**：玉米种子微生物群落（BC 距离 0.003–0.999，均值 0.591），高多样性，群落组成变化大
+   - **测试数据**：双菌种合成群落（BC 距离 0.002–0.274，均值 0.090），极低多样性，主要是两个物种的丰度比例变化
+   - 编码器学到的特征表示针对高多样性群落优化，在简单系统上可能过度复杂
+
+2. **距离度量尺度不匹配**
+   - 孪生网络预测的距离被压缩在 0.43–0.94 之间，无法覆盖合成群落中 BC 距离的真实范围（0.00–0.27）
+   - 模型从未见过 BC < 0.003 的样本对（训练数据最小值），因此无法预测极小的距离值
+   - 标准化参数（y_mean = 0.59）来自训练数据，但合成群落的平均 BC 距离仅 0.09
+
+3. **标准化策略失配**
+   - 使用玉米种子数据的 x_mean 和 x_std 标准化合成群落数据
+   - 两个数据集的 HRM 曲线数值范围和形状可能完全不同
+   - 标准化后的特征空间可能不在编码器的有效工作范围内
+
+4. **温度维度差异**
+   - 玉米种子训练数据使用 99 个温度点
+   - Application HRM 数据有 100 个温度点
+   - 这种差异阻碍了编码器的直接使用
+
+### 为什么欧氏距离表现更好？
+
+1. **简单系统的优势**：双菌种系统的群落差异主要体现在 HRM 曲线的整体形状变化，欧氏距离直接测量点对点差异
+2. **无需训练**：欧氏距离不依赖训练数据的分布假设，对新数据集有天然鲁棒性
+3. **无尺度偏差**：欧氏距离的计算与数据范围直接相关，不存在标准化失配问题
+
+### 与原始训练的对比
+
+在玉米种子数据的测试集上，孪生网络将 HRM 欧氏距离与 BC 距离的相关性从 Spearman r = 0.36 提升至 0.99。但在合成群落数据上，情况完全相反——欧氏距离（r = 0.25）优于孪生网络（r = 0.05）。这说明：
+
+- **域内泛化**（同数据集）：孪生网络表现出色，显著优于欧氏距离
+- **跨域泛化**（不同数据集）：孪生网络失效，欧氏距离反而更稳健
+
+## 讨论
+
+### 模型的适用边界
+
+这一负面结果为理解 HRM 深度学习模型的适用范围提供了重要信息：
+
+1. 在玉米种子微生物群落（复杂、高多样性）的**域内**预测中，孪生网络表现出色
+2. 当推广到双菌种人工群落（简单、低多样性）时，模型失效
+3. 模型的泛化能力局限于与训练数据**生态复杂度相似**的样本
+
+### 科学价值
+
+虽然是负面结果，但具有以下科学价值：
+
+1. **明确了模型适用边界**：复杂群落 → 简单群落的迁移不可行
+2. **验证了评估方法**：使用独立数据集测试泛化能力是评估模型鲁棒性的必要步骤
+3. **指明了改进方向**：域自适应、多任务学习是提高泛化能力的潜在路径
+
+### 改进方向
+
+**短期改进**（针对当前模型）：
+
+1. **域自适应微调**：在合成群落数据上用低学习率微调解码器
+2. **重新标准化**：使用合成群落数据的统计量替代玉米种子数据的标准化参数
+3. **温度点对齐**：确保训练和测试数据的温度点完全一致
+
+**长期改进**（模型重设计）：
+
+1. **多任务学习**：同时在复杂和简单群落数据上训练，共享编码器
+2. **层次化建模**：低层捕捉局部曲线形状，高层捕捉全局群落组成
+3. **距离校准**：添加校准层，使预测距离适应不同生态复杂度的数据集
+
+## 方法摘要
+
+### NGS 数据处理
+
+| 步骤 | 数值 |
+|------|------|
+| 输入样本 | 40 个（A2–E5，每个代表一种碳源培养条件） |
+| 原始 ASV 数（DADA2） | 205 |
+| 去嵌合体后 | 107 |
+| 读数保留率 | 86.63% |
+| 低丰度 ASV（<0.1% 总读数） | 105（98.1%） |
+| 高丰度 ASV | 2（1.9%） |
+| 合并后 ASV 数 | 3（2 个优势 ASV + "Other"） |
+
+### 生成文件
+
+| 文件 | 说明 |
+|------|------|
+| `data-clean/hrm-siamese-generalization-hrm.csv` | 重新处理的 HRM 数据（80–90°C） |
+| `data-clean/hrm-siamese-generalization-asv.csv` | ASV 丰度表（40 样本 × 3 ASV） |
+| `data-clean/hrm-siamese-generalization-bc.csv` | 16S Bray-Curtis 距离矩阵 |
+| `data-clean/hrm-siamese-generalization-predictions.csv` | 迁移学习预测结果 |
+| `data-clean/hrm-siamese-generalization-dist.csv` | 孪生网络距离矩阵 |
+| `data-clean/hrm-siamese-generalization-euclidean.csv` | 欧氏距离矩阵 |

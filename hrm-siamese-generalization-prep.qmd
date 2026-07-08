@@ -1,0 +1,158 @@
+---
+title: "Siamese Generalization — Data Preprocessing"
+author: "Chun-Hui Gao"
+date: "2026-07-08"
+---
+
+## 目标
+
+重新处理 method-evaluation 验证实验的原始 qPCR 数据，将熔解曲线温度范围统一为 **80-90°C**（步长 0.1°C），与训练数据（20230512.csv）保持一致，用于深度学习模型的泛化能力测试。
+
+{{< include global-settings.qmd >}}
+
+## 加载原始数据
+
+```{r}
+library(mcmodel)
+
+# 读取 qPCR 原始结果
+filename = "data-raw/application-qPCR/application-qPCR-result.txt"
+plate_layout = read.csv("data-raw/application-qPCR/application-plate-layout.csv")
+
+all_data = read_quantstudio(filename)
+```
+
+## 提取 16S 通用引物的熔解曲线
+
+验证实验使用三种引物：
+- **EC**：*E. coli* 特异性引物（用于 qPCR 定量）
+- **PP**：*P. putida* 特异性引物（用于 qPCR 定量）
+- **16S**：通用 16S rRNA 引物（用于 HRM 分析）
+
+我们只需要 16S 引物的熔解曲线数据。
+
+```{r}
+# 筛选 16S 样本
+sample_16s = plate_layout |>
+  filter(target == '16S') |>
+  mutate(cycle = 30)  # 实验在 cycle 30 进行 HRM
+
+# 转换为 mcmodel 格式
+mc_application = quantstudio2mc(all_data, plate = sample_16s) |>
+  filterData(from = 80, to = 90, well_position = sample_16s$well_position) |>
+  transformData(step = 0.1)
+
+# 检查数据
+print(mc_application)
+```
+
+## 转换为宽格式
+
+```{r}
+data_application = mc_tbl2wider(mc_application)
+
+# 检查温度列范围
+temp_cols = colnames(data_application)[grep("^T", colnames(data_application))]
+cat("温度范围:", temp_cols[1], "到", temp_cols[length(temp_cols)], "\n")
+cat("温度点数:", length(temp_cols), "\n")
+
+# 查看数据结构
+head(data_application)
+```
+
+## 保存数据
+
+```{r}
+write_csv(data_application, "data-clean/hrm-siamese-generalization-hrm.csv")
+cat("数据已保存到: data-clean/hrm-siamese-generalization-hrm.csv\n")
+cat("样本数:", nrow(data_application), "\n")
+```
+
+## 数据质量检查
+
+```{r}
+# 检查是否有缺失值
+missing_count = sum(is.na(data_application[, temp_cols]))
+cat("缺失值数量:", missing_count, "\n")
+
+# 检查导数值范围
+deriv_values = as.matrix(data_application[, temp_cols])
+cat("导数范围: [", min(deriv_values, na.rm = TRUE), ",",
+    max(deriv_values, na.rm = TRUE), "]\n")
+
+# 绘制部分样本的熔解曲线
+library(ggplot2)
+sample_data = data_application |>
+  slice(1:6) |>
+  select(sample, all_of(temp_cols)) |>
+  pivot_longer(cols = all_of(temp_cols),
+               names_to = "temperature",
+               values_to = "derivative") |>
+  mutate(temp_numeric = as.numeric(gsub("T", "", temperature)))
+
+ggplot(sample_data, aes(temp_numeric, derivative, color = sample, group = sample)) +
+  geom_line() +
+  labs(x = "Temperature (°C)", y = "Derivative (-dF/dT)",
+       title = "HRM Curves (80-90°C, First 6 Samples)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## 与训练数据对比
+
+```{r}
+# 读取训练数据检查一致性
+train_data = read.csv("data-clean/20230512.csv")
+train_temp_cols = colnames(train_data)[grep("^T", colnames(train_data))]
+
+cat("\n=== 温度范围对比 ===\n")
+cat("训练数据 (20230512):\n")
+cat("  温度范围:", train_temp_cols[1], "到", train_temp_cols[length(train_temp_cols)], "\n")
+cat("  温度点数:", length(train_temp_cols), "\n")
+
+cat("\n验证数据 (application):\n")
+cat("  温度范围:", temp_cols[1], "到", temp_cols[length(temp_cols)], "\n")
+cat("  温度点数:", length(temp_cols), "\n")
+
+# 检查温度列名是否完全一致
+if (identical(train_temp_cols, temp_cols)) {
+  cat("\n✓ 温度列名完全一致，可以直接用于模型预测\n")
+} else {
+  cat("\n⚠ 温度列名不一致，需要进一步对齐\n")
+
+  # 找出差异
+  only_in_train = setdiff(train_temp_cols, temp_cols)
+  only_in_test = setdiff(temp_cols, train_temp_cols)
+
+  if (length(only_in_train) > 0) {
+    cat("仅在训练数据中:", head(only_in_train, 5), "...\n")
+  }
+  if (length(only_in_test) > 0) {
+    cat("仅在验证数据中:", head(only_in_test, 5), "...\n")
+  }
+}
+```
+
+## 样本信息汇总
+
+```{r}
+# 汇总样本信息
+sample_summary = data_application |>
+  group_by(sample, carbon_source, carbon_id) |>
+  summarise(n_replicates = n(), .groups = "drop") |>
+  arrange(carbon_id)
+
+knitr::kable(sample_summary, caption = "验证实验样本列表")
+
+cat("\n总样本数:", length(unique(data_application$sample)), "\n")
+cat("碳源种类数:", length(unique(data_application$carbon_source)), "\n")
+```
+
+## 备注
+
+- **原始温度范围**：75-90°C（150 个温度点）
+- **新温度范围**：80-90°C（100 个温度点）
+- **步长**：0.1°C
+- **用途**：深度学习模型泛化能力测试
+
+这样处理后，验证数据与训练数据的温度点数完全一致，可以直接输入到预训练的孪生网络编码器中进行特征提取。

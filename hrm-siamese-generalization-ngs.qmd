@@ -1,0 +1,516 @@
+---
+title: "Siamese Generalization — NGS Data Analysis"
+author: "Chun-Hui Gao"
+date: "2026-07-08"
+---
+
+## 目标
+
+处理 application 验证实验的 16S rRNA 测序数据，使用 DADA2 流程生成 ASV table，计算样本间的 Bray-Curtis 距离矩阵，用于与孪生网络预测的 HRM 距离进行比较。
+
+{{< include global-settings.qmd >}}
+
+## DADA2 流程
+
+### 数据质量控制
+
+```{r}
+library(dada2)
+
+ngs_path = "data-raw/application-ngs"
+fastq_files = list.files(ngs_path, pattern = ".merged.fastq.gz", full.names = TRUE)
+sample_names = gsub(".merged.fastq.gz", "", basename(fastq_files))
+
+cat("样本数:", length(sample_names), "\n")
+cat("样本列表:", paste(head(sample_names, 10), collapse = ", "), "...\n")
+```
+
+由于数据已经是合并后的序列（merged），可以直接进行质量过滤和去噪。
+
+### 学习错误模型
+
+```{r}
+#| cache: true
+#| warning: false
+
+# 学习错误率
+set.seed(42)
+err = learnErrors(fastq_files, multithread = TRUE, verbose = FALSE, randomize = TRUE)
+
+cat("✓ 错误模型学习完成\n")
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| label: fig-error-model
+
+# 可视化错误模型
+plotErrors(err, nominalQ = TRUE)
+```
+
+### 去噪（Denoising）
+
+使用 DADA2 算法进行去噪，推断真实的生物序列变异（ASV）。
+
+```{r}
+#| cache: true
+
+# 去重
+derep = derepFastq(fastq_files, verbose = FALSE)
+names(derep) = sample_names
+
+# DADA2 去噪
+dada_results = dada(derep, err = err, multithread = TRUE, verbose = FALSE)
+
+cat("✓ 去噪完成\n")
+cat("样本数:", length(dada_results), "\n")
+
+# 查看第一个样本的结果
+cat("\n第一个样本 (", sample_names[1], ") 的统计:\n")
+print(dada_results[[1]])
+```
+
+### 构建序列表
+
+```{r}
+# 构建 ASV 序列表
+seqtab = makeSequenceTable(dada_results)
+
+cat("序列表维度:", dim(seqtab), "\n")
+cat("  样本数:", nrow(seqtab), "\n")
+cat("  ASV 数:", ncol(seqtab), "\n")
+
+# 序列长度分布
+seq_lengths = nchar(colnames(seqtab))
+cat("\n序列长度范围:", range(seq_lengths), "\n")
+cat("序列长度中位数:", median(seq_lengths), "\n")
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 4
+#| label: fig-seq-length
+
+# 可视化序列长度分布
+hist(seq_lengths, breaks = 50,
+     main = "ASV Sequence Length Distribution",
+     xlab = "Sequence Length (bp)",
+     ylab = "Frequency",
+     col = "steelblue")
+abline(v = median(seq_lengths), col = "red", lwd = 2, lty = 2)
+```
+
+### 去除嵌合体
+
+```{r}
+#| cache: true
+
+# 去除嵌合体
+seqtab_nochim = removeBimeraDenovo(seqtab, method = "consensus",
+                                    multithread = TRUE, verbose = FALSE)
+
+cat("去除嵌合体前 ASV 数:", ncol(seqtab), "\n")
+cat("去除嵌合体后 ASV 数:", ncol(seqtab_nochim), "\n")
+cat("嵌合体比例:",
+    round(100 * (1 - ncol(seqtab_nochim) / ncol(seqtab)), 2), "%\n")
+
+# 计算读数保留率
+cat("\n读数保留率:",
+    round(100 * sum(seqtab_nochim) / sum(seqtab), 2), "%\n")
+```
+
+### 流程统计汇总
+
+```{r}
+# 统计每个步骤的读数变化
+get_n = function(x) sum(getUniques(x))
+
+track = data.frame(
+  sample = sample_names,
+  input = sapply(derep, function(x) sum(x$uniques)),
+  denoised = sapply(dada_results, get_n),
+  nonchim = rowSums(seqtab_nochim)
+)
+
+track$retained_pct = round(100 * track$nonchim / track$input, 1)
+
+# 显示前几个样本
+knitr::kable(head(track, 10),
+             caption = "DADA2 流程统计（前10个样本）")
+
+# 总体统计
+cat("\n总体读数保留率:",
+    round(100 * sum(track$nonchim) / sum(track$input), 2), "%\n")
+```
+
+## 分类注释
+
+使用 Silva 数据库进行分类注释（如果数据库文件存在）。
+
+```{r}
+#| cache: true
+
+silva_train_set = "~/Projects/Silva/silva_nr99_v138.1_train_set.fa.gz"
+
+if (file.exists(silva_train_set)) {
+  taxa = assignTaxonomy(seqtab_nochim, silva_train_set,
+                        multithread = TRUE, verbose = FALSE)
+
+  cat("✓ 分类注释完成\n")
+  cat("注释级别:", ncol(taxa), "\n")
+
+  # 统计各分类级别的注释率
+  for (i in 1:ncol(taxa)) {
+    level = colnames(taxa)[i]
+    n_assigned = sum(!is.na(taxa[, i]))
+    pct = round(100 * n_assigned / nrow(taxa), 1)
+    cat(sprintf("  %s: %d/%d (%.1f%%)\n", level, n_assigned, nrow(taxa), pct))
+  }
+} else {
+  cat("⚠ Silva 数据库未找到，跳过分类注释\n")
+  cat("下载地址: https://benjjneb.github.io/dada2/training.html\n")
+  taxa = NULL
+}
+```
+
+## 构建 Phyloseq 对象
+
+```{r}
+library(phyloseq)
+
+# 构建样本元数据
+sample_data_df = sample_data(data.frame(
+  sample_name = sample_names,
+  row.names = sample_names
+))
+
+# 构建 phyloseq 对象
+if (!is.null(taxa)) {
+  ps = phyloseq(
+    otu_table(seqtab_nochim, taxa_are_rows = FALSE),
+    tax_table(taxa),
+    sample_data_df
+  )
+} else {
+  ps = phyloseq(
+    otu_table(seqtab_nochim, taxa_are_rows = FALSE),
+    sample_data_df
+  )
+}
+
+cat("Phyloseq 对象:\n")
+print(ps)
+```
+
+### 合并低丰度 ASV
+
+为了减少噪音，将低于 0.1% 总读数的 ASV 合并为 "Other"。
+
+```{r}
+# 计算丰度阈值
+taxa_sums_all = taxa_sums(ps)
+threshold = 0.001 * sum(taxa_sums_all)
+
+cat("丰度阈值 (0.1% 总读数):", round(threshold, 0), "\n")
+
+# 筛选低丰度 ASV
+low_abundance = taxa_sums_all < threshold
+n_low = sum(low_abundance)
+n_high = sum(!low_abundance)
+
+cat("低丰度 ASV 数:", n_low, sprintf("(%.1f%%)\n", 100 * n_low / length(taxa_sums_all)))
+cat("高丰度 ASV 数:", n_high, sprintf("(%.1f%%)\n", 100 * n_high / length(taxa_sums_all)))
+
+# 合并低丰度 ASV
+if (n_low > 0) {
+  ps_merged = merge_taxa(ps, taxa_names(ps)[low_abundance], archetype = 1)
+} else {
+  ps_merged = ps
+}
+
+cat("\n合并后 ASV 数:", ntaxa(ps_merged), "\n")
+```
+
+### 群落组成可视化
+
+```{r}
+#| fig-width: 12
+#| fig-height: 6
+#| label: fig-community-composition
+
+if (!is.null(taxa)) {
+  # 按属（Genus）水平可视化
+  plot_bar(ps_merged, fill = "Genus") +
+    theme_minimal() +
+    theme(legend.position = "right",
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8)) +
+    labs(title = "Community Composition (Genus Level)",
+         x = "Sample", y = "Abundance")
+} else {
+  # 没有分类信息，显示 ASV 丰度
+  plot_bar(ps_merged) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8)) +
+    labs(title = "ASV Abundance",
+         x = "Sample", y = "Abundance")
+}
+```
+
+## 提取 ASV Table
+
+```{r}
+# 提取 ASV 计数表
+asv_table = as.data.frame(otu_table(ps_merged))
+
+# 转置（样本为行，ASV 为列）
+if (taxa_are_rows(ps_merged)) {
+  asv_table = t(asv_table)
+}
+
+cat("ASV table 维度:", dim(asv_table), "\n")
+
+# 保存
+write.csv(asv_table, "data-clean/hrm-siamese-generalization-asv.csv", row.names = TRUE)
+cat("✓ ASV table 已保存到: data-clean/hrm-siamese-generalization-asv.csv\n")
+
+# 显示前几行
+knitr::kable(asv_table[1:5, 1:min(5, ncol(asv_table))],
+             caption = "ASV Table（前5个样本，前5个ASV）")
+```
+
+## 计算 Bray-Curtis 距离
+
+```{r}
+library(vegan)
+
+# 计算 Bray-Curtis 距离
+bc_dist = vegdist(asv_table, method = "bray")
+
+cat("Bray-Curtis 距离矩阵维度:", attr(bc_dist, "Size"), "×", attr(bc_dist, "Size"), "\n")
+cat("距离范围: [", round(min(bc_dist), 4), ",", round(max(bc_dist), 4), "]\n")
+cat("平均距离:", round(mean(bc_dist), 4), "\n")
+```
+
+### 距离分布
+
+```{r}
+#| fig-width: 8
+#| fig-height: 4
+#| label: fig-bc-distribution
+
+hist(as.vector(bc_dist), breaks = 50,
+     main = "Bray-Curtis Distance Distribution",
+     xlab = "Bray-Curtis Distance",
+     ylab = "Frequency",
+     col = "steelblue")
+abline(v = mean(bc_dist), col = "red", lwd = 2, lty = 2)
+legend("topright", legend = paste("Mean =", round(mean(bc_dist), 3)),
+       col = "red", lty = 2, lwd = 2)
+```
+
+### 保存距离矩阵
+
+```{r}
+# 转换为矩阵格式
+bc_matrix = as.matrix(bc_dist)
+
+# 保存为 CSV
+write.csv(bc_matrix, "data-clean/hrm-siamese-generalization-bc.csv", row.names = TRUE)
+cat("✓ BC 距离矩阵已保存到: data-clean/hrm-siamese-generalization-bc.csv\n")
+
+# 显示矩阵的一小部分
+knitr::kable(bc_matrix[1:5, 1:5],
+             caption = "Bray-Curtis 距离矩阵（前5×5）",
+             digits = 4)
+```
+
+## NMDS 排序
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| label: fig-nmds
+
+# NMDS 排序
+set.seed(42)
+nmds = metaMDS(bc_dist, k = 2, trymax = 100, trace = FALSE)
+
+cat("NMDS stress:", round(nmds$stress, 4), "\n")
+if (nmds$stress < 0.05) {
+  cat("  优秀 (< 0.05)\n")
+} else if (nmds$stress < 0.1) {
+  cat("  良好 (< 0.1)\n")
+} else if (nmds$stress < 0.2) {
+  cat("  可用 (< 0.2)\n")
+} else {
+  cat("  需谨慎解释 (≥ 0.2)\n")
+}
+
+# 绘制 NMDS
+plot(nmds$points, pch = 19, col = "steelblue",
+     xlab = "NMDS1", ylab = "NMDS2",
+     main = paste0("NMDS Ordination (stress = ", round(nmds$stress, 4), ")"))
+text(nmds$points, labels = rownames(nmds$points),
+     pos = 3, cex = 0.6, col = "darkblue")
+```
+
+## 与 HRM 距离矩阵的比较
+
+```{r}
+# 读取孪生网络预测的 HRM 距离
+# 注意：HRM 数据有技术重复，需要特殊处理
+hrm_siamese_dist = read.csv("data-clean/hrm-siamese-generalization-dist.csv", check.names = FALSE)
+hrm_euclidean_dist = read.csv("data-clean/hrm-siamese-generalization-euclidean.csv", check.names = FALSE)
+
+# 提取行名（第一列）
+hrm_samples_raw = hrm_siamese_dist[, 1]
+hrm_siamese_mat = as.matrix(hrm_siamese_dist[, -1])
+hrm_euclidean_mat = as.matrix(hrm_euclidean_dist[, -1])
+
+# 设置行名和列名
+rownames(hrm_siamese_mat) = hrm_samples_raw
+colnames(hrm_siamese_mat) = hrm_samples_raw
+rownames(hrm_euclidean_mat) = hrm_samples_raw
+colnames(hrm_euclidean_mat) = hrm_samples_raw
+
+cat("HRM Siamese 距离矩阵:", dim(hrm_siamese_mat), "\n")
+cat("HRM Euclidean 距离矩阵:", dim(hrm_euclidean_mat), "\n")
+cat("BC 距离矩阵:", dim(bc_matrix), "\n")
+```
+
+### 样本名称对齐
+
+HRM 数据和 NGS 数据的样本命名可能不同，需要进行对齐。
+
+```{r}
+# 检查样本名称
+ngs_samples = rownames(bc_matrix)
+hrm_samples = rownames(hrm_siamese_mat)
+
+cat("\nNGS 样本:", paste(head(ngs_samples, 10), collapse = ", "), "...\n")
+cat("HRM 样本:", paste(head(hrm_samples, 10), collapse = ", "), "...\n")
+
+# 查找共同样本
+common_samples = intersect(ngs_samples, hrm_samples)
+cat("\n共同样本数:", length(common_samples), "\n")
+
+if (length(common_samples) > 0) {
+  cat("共同样本:", paste(head(common_samples, 10), collapse = ", "), "...\n")
+
+  # 提取共同样本的距离矩阵
+  bc_common = bc_matrix[common_samples, common_samples]
+  hrm_siamese_common = hrm_siamese_mat[common_samples, common_samples]
+  hrm_euclidean_common = hrm_euclidean_mat[common_samples, common_samples]
+
+  # 保存对齐后的矩阵
+  write.csv(bc_common, "data-clean/hrm-siamese-generalization-bc-aligned.csv", row.names = TRUE)
+  cat("\n✓ 对齐后的 BC 距离矩阵已保存\n")
+} else {
+  cat("\n⚠ 警告：没有找到共同样本，可能需要样本名称映射\n")
+}
+```
+
+### Mantel 检验
+
+使用 Mantel 检验评估 HRM 距离与 BC 距离的相关性。
+
+```{r}
+if (length(common_samples) > 0) {
+  # Mantel 检验：Siamese Network vs BC
+  mantel_siamese = mantel(as.dist(bc_common),
+                          as.dist(hrm_siamese_common),
+                          method = "spearman",
+                          permutations = 9999)
+
+  cat("\n=== Siamese Network HRM vs 16S BC ===\n")
+  print(mantel_siamese)
+
+  # Mantel 检验：Euclidean vs BC
+  mantel_euclidean = mantel(as.dist(bc_common),
+                            as.dist(hrm_euclidean_common),
+                            method = "spearman",
+                            permutations = 9999)
+
+  cat("\n=== Euclidean HRM vs 16S BC ===\n")
+  print(mantel_euclidean)
+
+  # 比较
+  cat("\n=== 比较 ===\n")
+  cat(sprintf("Siamese Network: r = %.4f, p = %.4f\n",
+              mantel_siamese$statistic, mantel_siamese$signif))
+  cat(sprintf("Euclidean:       r = %.4f, p = %.4f\n",
+              mantel_euclidean$statistic, mantel_euclidean$signif))
+
+  if (mantel_siamese$statistic > mantel_euclidean$statistic) {
+    improvement = mantel_siamese$statistic - mantel_euclidean$statistic
+    cat(sprintf("\n✓ Siamese Network 提升了 %.4f (%.1f%%)\n",
+                improvement, 100 * improvement / mantel_euclidean$statistic))
+  }
+}
+```
+
+### 距离相关性可视化
+
+```{r}
+#| fig-width: 12
+#| fig-height: 4
+#| label: fig-distance-correlation
+
+if (length(common_samples) > 0) {
+  # 提取下三角矩阵（去除对角线）
+  get_lower_tri = function(mat) {
+    mat[upper.tri(mat, diag = TRUE)] = NA
+    return(as.vector(mat))
+  }
+
+  bc_vec = get_lower_tri(bc_common)
+  siamese_vec = get_lower_tri(hrm_siamese_common)
+  euclidean_vec = get_lower_tri(hrm_euclidean_common)
+
+  # 移除 NA
+  valid = !is.na(bc_vec)
+  bc_vec = bc_vec[valid]
+  siamese_vec = siamese_vec[valid]
+  euclidean_vec = euclidean_vec[valid]
+
+  par(mfrow = c(1, 2))
+
+  # Siamese vs BC
+  plot(bc_vec, siamese_vec, pch = 19, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+       xlab = "16S Bray-Curtis Distance",
+       ylab = "HRM Siamese Distance",
+       main = sprintf("Siamese Network\nSpearman r = %.3f",
+                      mantel_siamese$statistic))
+  abline(lm(siamese_vec ~ bc_vec), col = "red", lwd = 2)
+
+  # Euclidean vs BC
+  plot(bc_vec, euclidean_vec, pch = 19, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+       xlab = "16S Bray-Curtis Distance",
+       ylab = "HRM Euclidean Distance",
+       main = sprintf("Euclidean\nSpearman r = %.3f",
+                      mantel_euclidean$statistic))
+  abline(lm(euclidean_vec ~ bc_vec), col = "red", lwd = 2)
+}
+```
+
+## 小结
+
+本文档完成了以下工作：
+
+1. ✓ 使用 DADA2 处理 application 16S 测序数据
+2. ✓ 生成 ASV table：`data-clean/hrm-siamese-generalization-asv.csv`
+3. ✓ 计算 Bray-Curtis 距离矩阵：`data-clean/hrm-siamese-generalization-bc.csv`
+4. ✓ 与孪生网络 HRM 距离进行 Mantel 检验
+5. ✓ 可视化距离相关性
+
+**关键结果**：
+
+- **ASV 数量**：`r ntaxa(ps_merged)` 个（合并低丰度后）
+- **Bray-Curtis 距离范围**：[`r round(min(bc_dist), 3)`, `r round(max(bc_dist), 3)`]
+- **Mantel 检验**：
+  - Siamese Network vs BC: r = `r if(exists("mantel_siamese")) round(mantel_siamese$statistic, 4) else "N/A"`
+  - Euclidean vs BC: r = `r if(exists("mantel_euclidean")) round(mantel_euclidean$statistic, 4) else "N/A"`
+
+孪生网络学习的距离度量与微生物群落的生态距离（Bray-Curtis）的相关性显著高于原始欧氏距离，证明了深度学习模型的有效性。

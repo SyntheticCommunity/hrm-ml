@@ -9,6 +9,9 @@
 /*_files/
 /_book/
 data-clean/hrm-dl-*.csv
+data-clean/hrm-siamese-generalization-*.csv
+hrm-siamese-generalization*.html
+models/
 figures/figure-260319-rf.jpg
 figures/figure-260529-rf.jpg
 figures/figure-exp-260529-single-species.jpg

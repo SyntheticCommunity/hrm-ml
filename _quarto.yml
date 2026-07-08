@@ -35,6 +35,11 @@ book:
         - hrm-deep-learning-metric.qmd
         - hrm-deep-learning-triplet.qmd
         - hrm-deep-learning-evaluation.qmd
+    - part: "Siamese Network: Generalization Test"
+      chapters:
+        - hrm-siamese-generalization-prep.qmd
+        - hrm-siamese-generalization-ngs.qmd
+        - hrm-siamese-generalization.qmd
     - references.qmd
 
 bibliography: references.bib

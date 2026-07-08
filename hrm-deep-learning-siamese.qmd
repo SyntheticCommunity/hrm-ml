@@ -190,3 +190,29 @@ pd.DataFrame(dm, index=sample_names, columns=sample_names).to_csv(
     "data-clean/hrm-dl-siamese-dist.csv")
 print(f"Siamese 导出完成: {len(pred_all)} 对预测, {n_samples}x{n_samples} 距离矩阵")
 ```
+
+## 保存模型权重和标准化参数
+
+为了在其他数据集上测试泛化能力，保存模型权重和标准化参数：
+
+```{python}
+import os
+os.makedirs("models", exist_ok=True)
+
+# 保存模型权重
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'x_mean': x_mean,
+    'x_std': x_std,
+    'y_mean': y_mean,
+    'y_std': y_std,
+    'n_temp': n_temp,
+    'hidden': 128,
+    'emb_dim': 32,
+}, "models/siamese_corn_seed.pt")
+
+print("✓ 模型权重已保存到: models/siamese_corn_seed.pt")
+print(f"  - 输入维度: {n_temp}")
+print(f"  - 嵌入维度: 32")
+print(f"  - 标准化参数: x_mean, x_std, y_mean, y_std")
+```
